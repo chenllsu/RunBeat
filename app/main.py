@@ -50,7 +50,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="RunBeat", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="RunBeat", version="0.2.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------
