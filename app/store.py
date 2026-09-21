@@ -13,6 +13,20 @@ from . import config
 _lock = threading.RLock()
 _files: dict[str, dict] = {}
 
+# ---------------------------------------------------------------- 可清理的类别
+# kind 是接口里用的稳定标识，顺序就是前端「缓存与数据」面板的展示顺序。
+# 把这张表集中在一处，是为了让「有哪些东西能被删」只有一个出处 ——
+# 前端复制一份顺序会导致两边悄悄跑偏。
+CLEARABLE: tuple[tuple[str, Path], ...] = (
+    ("previews", config.PREVIEW_DIR),
+    ("tmp", config.TMP_DIR),
+    ("analysis", config.ANALYSIS_DIR),
+    ("outputs", config.OUTPUT_DIR),
+    ("uploads", config.UPLOAD_DIR),
+)
+
+CLEARABLE_KINDS: tuple[str, ...] = tuple(kind for kind, _ in CLEARABLE)
+
 
 def new_id() -> str:
     return uuid.uuid4().hex[:16]
@@ -150,3 +164,93 @@ def stats() -> dict:
         except OSError:
             counts[name] = 0
     return {"tracked_files": tracked, "disk": counts}
+
+
+def storage_report() -> dict:
+    """各数据目录的文件数与占用字节，供「缓存与数据」面板显示。
+
+    只读目录、不做任何判断 —— 哪些该删由用户勾选，这里不预设。
+    """
+    items = []
+    total_files = 0
+    total_bytes = 0
+    for kind, folder in CLEARABLE:
+        files = 0
+        size = 0
+        try:
+            for path in folder.iterdir():
+                try:
+                    if path.is_file():
+                        files += 1
+                        size += path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        items.append({"kind": kind, "files": files, "bytes": size})
+        total_files += files
+        total_bytes += size
+
+    with _lock:
+        tracked = len(_files)
+
+    return {
+        "items": items,
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "tracked_files": tracked,
+    }
+
+
+def clear(kinds) -> dict:
+    """按类别删除运行时文件，返回每类**实际删掉**的文件数与字节数。
+
+    只删 ``CLEARABLE`` 里登记过的目录，调用方传来的未知类别直接忽略 ——
+    这个函数会被接口直接调用，不能给「拼个路径就删」留口子。
+
+    ``uploads`` 比较特殊：它是被内存登记表引用着的那一份，删掉之后对应记录
+    必须一起摘掉。否则表里会留着一批 ``source_path`` 已经不存在的死记录 ——
+    页面上点它只会拿到 410，而 ``stats()`` 的文件计数会一直虚高。
+    顺带把它的 ``analysis_path`` 也删掉，免得分析文件变成孤儿。
+    """
+    wanted = set(kinds)
+    result = {"items": [], "files": 0, "bytes": 0, "dropped_records": 0}
+
+    for kind, folder in CLEARABLE:
+        if kind not in wanted:
+            continue
+        try:
+            paths = [p for p in folder.iterdir() if p.is_file()]
+        except OSError:
+            paths = []
+
+        files = 0
+        size = 0
+        for path in paths:
+            try:
+                nbytes = path.stat().st_size
+            except OSError:
+                nbytes = 0
+            if safe_unlink(path):
+                files += 1
+                size += nbytes
+
+        result["items"].append({"kind": kind, "files": files, "bytes": size})
+        result["files"] += files
+        result["bytes"] += size
+
+    if "uploads" in wanted:
+        with _lock:
+            gone = [
+                fid
+                for fid, rec in _files.items()
+                if rec.get("source_path") and not Path(rec["source_path"]).is_file()
+            ]
+            for fid in gone:
+                record = _files.pop(fid, None) or {}
+                analysis = record.get("analysis_path")
+                if analysis:
+                    safe_unlink(Path(analysis))
+        result["dropped_records"] = len(gone)
+
+    return result

@@ -5,6 +5,7 @@ data/uploads/*
 data/analysis/*
 data/previews/*
 data/outputs/*
+data/tmp/*
 !data/uploads/.gitkeep
 !data/analysis/.gitkeep
 !data/previews/.gitkeep

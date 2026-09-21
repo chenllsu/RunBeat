@@ -234,6 +234,63 @@
 
   </div>
 
+  <!-- ============================ 6 缓存与数据
+       注意：这一节必须在 #panel **外面**。它管的是磁盘上的临时文件，
+       跟「有没有加载歌曲」无关 —— 放进 #panel 里的话，没上传歌的时候
+       整个面板都看不见，而那恰恰是最需要清缓存的时候。 -->
+  <section class="card">
+    <h2><span class="idx">6</span>缓存与数据
+      <span class="cache-total" id="cacheTotal">—</span>
+    </h2>
+    <div class="hint" style="margin-top:0">
+      上传的原文件、分析文件、试听片段、成品都存在本机的 data 目录里。
+      删掉不影响程序运行，需要时会重新生成。
+    </div>
+
+    <div class="cache-row">
+      <button class="btn ghost" id="cacheToggleBtn" type="button">
+        <span class="btn-label">清理缓存</span>
+      </button>
+      <span class="cache-sum" id="cacheSum">—</span>
+    </div>
+
+    <div class="cache-panel" id="cachePanel" hidden>
+      <div class="cache-list" id="cacheList"></div>
+
+      <div class="cache-quick">
+        <span class="cache-quick-lab">快捷：</span>
+        <button class="link" id="cachePickSafe" type="button">只选可再生的</button>
+        <button class="link" id="cachePickAll" type="button">全选</button>
+        <button class="link" id="cachePickNone" type="button">全不选</button>
+      </div>
+
+      <div class="cache-foot">
+        <span class="cache-picked" id="cachePicked">—</span>
+        <span class="cache-foot-btns">
+          <button class="btn ghost" id="cacheCancel" type="button">取消</button>
+          <button class="btn danger" id="cacheClearBtn" type="button">清理选中的</button>
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 清缓存的二次确认。删除不可恢复，所以是个真正的模态：遮住背景，只能选确认或取消 -->
+  <div class="modal" id="cacheModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cacheModalTitle">
+      <div class="modal-title" id="cacheModalTitle">确认清理</div>
+      <div class="modal-sub">删除后无法恢复。</div>
+      <div class="modal-list" id="cacheModalList"></div>
+      <div class="modal-warn" id="cacheModalWarn" hidden></div>
+      <div class="modal-foot">
+        <span class="modal-free" id="cacheModalFree">—</span>
+        <span class="modal-btns">
+          <button class="btn ghost" id="cacheModalCancel" type="button">取消</button>
+          <button class="btn danger" id="cacheModalOk" type="button">确认清理</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <footer class="foot">

@@ -766,3 +766,181 @@ footer.foot a { color: var(--muted); }
   .scope-legend { gap: 12px; }
   .beat-manual input { width: 68px; }
 }
+
+/* ----------------------------------------------------------- 缓存与数据 */
+
+.cache-total {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.cache-sum { font-size: 12px; color: var(--dim); }
+
+.cache-panel {
+  margin-top: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+/* 整行都是 label，点哪儿都能勾 —— 小方框本身只有 15px，不好点 */
+.cache-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  cursor: pointer;
+}
+.cache-item:last-child { border-bottom: none; }
+.cache-item:hover { background: var(--panel-2); }
+.cache-item.risky { background: #1a1518; }
+.cache-item.risky:hover { background: #211a1d; }
+.cache-item input {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  flex: 0 0 15px;
+}
+.cache-item.risky input { accent-color: var(--danger); }
+.cache-item-body { flex: 1; min-width: 0; }
+.cache-item-name { font-size: 13px; }
+.cache-item-note { font-size: 12px; color: var(--dim); margin-top: 2px; }
+.cache-item-note.warn { color: var(--warn); }
+.cache-item-note.bad { color: var(--danger); }
+
+.cache-quick {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  font-size: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.cache-quick-lab { color: var(--dim); }
+
+/* 快捷选择是「文字操作」，不该长得跟按钮一样重 */
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+button.link:hover { color: #2ee5b5; }
+
+.cache-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+.cache-picked { font-size: 12px; color: var(--muted); }
+.cache-foot-btns { display: inline-flex; gap: 8px; }
+
+button.btn.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #2a0b0d;
+  font-weight: 600;
+}
+button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6b70; }
+
+/* ----------------------------------------------------------- 二次确认弹窗 */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 6, 9, .72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 50;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 460px;
+  max-height: 100%;
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.modal-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.modal-sub { font-size: 12px; color: var(--muted); line-height: 1.6; margin-bottom: 14px; }
+
+.modal-list {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.modal-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.modal-row:last-child { border-bottom: none; }
+.modal-row .dir { color: var(--dim); }
+.modal-row .num { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.modal-row.risky { background: #1a1518; color: var(--danger); }
+.modal-row.risky .dir { color: #7a4a4d; }
+.modal-row.risky .num { color: #f09595; }
+
+.modal-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: #1a1518;
+  border: 1px solid #3a2226;
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12px;
+  color: #f09595;
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+.modal-warn .mark { color: var(--danger); flex: 0 0 auto; }
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.modal-free { font-size: 13px; color: var(--accent); }
+.modal-btns { display: inline-flex; gap: 8px; }
+
+@media (max-width: 560px) {
+  .cache-foot, .modal-foot { flex-direction: column; align-items: stretch; }
+  .cache-foot-btns, .modal-btns { justify-content: flex-end; }
+}
+

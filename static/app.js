@@ -1914,6 +1914,273 @@ liveAudio.addEventListener('error', () => {
   if (activeMode === 'live') toast('音频播放出错，试试重新上传', 'error');
 });
 
+/* ------------------------------------------------------------ 缓存与数据 */
+
+/* 类别元信息。kind 与后端 store.CLEARABLE 一一对应，顺序也照抄 ——
+ * 「有哪些东西能被删」的出处只有一个在后端，这里只负责显示文案。
+ * safe = 删掉之后能重新生成，没有损失；risky 的要在界面上明确标出来。 */
+const CACHE_KINDS = [
+  { kind: 'previews', label: '试听片段缓存', dir: 'previews', safe: true,
+    note: '下次试听时重新渲染' },
+  { kind: 'tmp', label: '混音临时文件', dir: 'tmp', safe: true,
+    note: '用完即删，通常本来就是空的' },
+  { kind: 'analysis', label: '分析文件', dir: 'analysis', safe: true,
+    note: '用来算拍点，可从原文件重算' },
+  { kind: 'outputs', label: '输出成品', dir: 'outputs', safe: false,
+    risk: 'warn', note: '已生成的下载链接会失效' },
+  { kind: 'uploads', label: '上传的原文件', dir: 'uploads', safe: false,
+    risk: 'bad', note: '删了要重新上传，当前页面那首歌会立即失效' },
+];
+
+const CACHE_SAFE = CACHE_KINDS.filter((k) => k.safe).map((k) => k.kind);
+
+let cacheReport = null;                    // 最近一次 /api/storage 的结果
+let cachePicked = new Set(CACHE_SAFE);     // 勾中的类别
+let cacheBusy = false;
+
+function formatBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return `${Math.round(b)} B`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`;
+  return `${(b / 1073741824).toFixed(2)} GB`;
+}
+
+function cacheRow(kind) {
+  const items = (cacheReport && cacheReport.items) || [];
+  return items.find((it) => it.kind === kind) || { kind, files: 0, bytes: 0 };
+}
+
+/* 当前真正会被删掉的类别：勾了、且有文件。空目录不往请求里塞 ——
+ * 否则会出现「已选 0 个文件」这种没意义的提交。 */
+function cachePickedItems() {
+  return CACHE_KINDS.filter((m) => cachePicked.has(m.kind) && cacheRow(m.kind).files > 0);
+}
+
+async function loadStorage() {
+  try {
+    const res = await fetch('/api/storage');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    cacheReport = data;
+  } catch (err) {
+    cacheReport = null;
+    $('cacheTotal').textContent = '读取失败';
+    $('cacheSum').textContent = err.message || '读不到 data 目录的状态';
+    return;
+  }
+  renderCachePanel();
+}
+
+function renderCachePanel() {
+  if (!cacheReport) return;
+
+  $('cacheTotal').textContent = `data/ 合计 ${formatBytes(cacheReport.total_bytes)}`;
+  $('cacheSum').textContent = cacheReport.total_files
+    ? `data/ 里现有 ${cacheReport.total_files} 个文件，共 ${formatBytes(cacheReport.total_bytes)}`
+    : 'data/ 现在是干净的';
+
+  const list = $('cacheList');
+  list.innerHTML = '';
+  for (const meta of CACHE_KINDS) {
+    const it = cacheRow(meta.kind);
+    const row = document.createElement('label');
+    row.className = 'cache-item' + (meta.safe ? '' : ' risky');
+
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.dataset.kind = meta.kind;
+    // 空目录一律不勾：勾了却没有文件可删，会让「已选 N 个文件」对不上，
+    // 界面上也会出现「勾着但点不动」的怪状态。这里保证勾 = 真的会被删。
+    box.checked = it.files > 0 && cachePicked.has(meta.kind);
+    box.disabled = cacheBusy || it.files === 0;
+    box.addEventListener('change', () => {
+      if (box.checked) cachePicked.add(meta.kind);
+      else cachePicked.delete(meta.kind);
+      updateCachePicked();
+    });
+
+    const body = document.createElement('div');
+    body.className = 'cache-item-body';
+    const name = document.createElement('div');
+    name.className = 'cache-item-name';
+    name.textContent = meta.label;
+    const note = document.createElement('div');
+    note.className = 'cache-item-note' + (meta.risk ? ' ' + meta.risk : '');
+    note.textContent = `${meta.dir} · ${it.files} 个文件 · ${formatBytes(it.bytes)}`
+      + (it.files ? ` · ${meta.note}` : '');
+    body.append(name, note);
+
+    row.append(box, body);
+    list.append(row);
+  }
+
+  updateCachePicked();
+}
+
+function updateCachePicked() {
+  const picked = cachePickedItems();
+  const files = picked.reduce((s, m) => s + cacheRow(m.kind).files, 0);
+  const bytes = picked.reduce((s, m) => s + cacheRow(m.kind).bytes, 0);
+
+  $('cachePicked').textContent = picked.length
+    ? `已选 ${files} 个文件 · ${formatBytes(bytes)}`
+    : '还没选任何内容';
+
+  const btn = $('cacheClearBtn');
+  btn.disabled = cacheBusy || !picked.length;
+  btn.textContent = picked.length ? `清理选中的 ${files} 个文件` : '清理选中的';
+}
+
+function toggleCachePanel(force) {
+  const panel = $('cachePanel');
+  const open = force === undefined ? panel.hidden : !!force;
+  panel.hidden = !open;
+  $('cacheToggleBtn').querySelector('.btn-label').textContent = open ? '收起' : '清理缓存';
+  if (open) {
+    cachePicked = new Set(CACHE_SAFE);    // 每次展开都回到「安全」那一档
+    loadStorage();
+  }
+}
+
+/* -------------------------------------------------- 二次确认
+ * 删除不可恢复，所以走一个真正的模态：背景遮住、只能选确认或取消，
+ * 而且要把它将删什么、有多少、影响是什么逐条摆出来。 */
+
+function openCacheModal() {
+  const picked = cachePickedItems();
+  if (!picked.length || cacheBusy) return;
+
+  let files = 0;
+  let bytes = 0;
+  const list = $('cacheModalList');
+  list.innerHTML = '';
+  for (const meta of picked) {
+    const it = cacheRow(meta.kind);
+    files += it.files;
+    bytes += it.bytes;
+
+    const row = document.createElement('div');
+    row.className = 'modal-row' + (meta.safe ? '' : ' risky');
+    const name = document.createElement('span');
+    name.textContent = meta.label + ' ';
+    const dir = document.createElement('span');
+    dir.className = 'dir';
+    dir.textContent = meta.dir;
+    name.append(dir);
+    const num = document.createElement('span');
+    num.className = 'num';
+    num.textContent = `${it.files} 个 · ${formatBytes(it.bytes)}`;
+    row.append(name, num);
+    list.append(row);
+  }
+
+  $('cacheModalTitle').textContent = `确认清理这 ${picked.length} 项？`;
+  $('cacheModalFree').textContent = `可释放 ${formatBytes(bytes)}`;
+
+  const kinds = picked.map((m) => m.kind);
+  const hasTrack = !!state.track;
+  const warn = $('cacheModalWarn');
+  let warnText = '';
+  if (kinds.includes('uploads')) {
+    warnText = hasTrack
+      ? '勾了「上传的原文件」，当前页面正在编辑的那首歌会失效，页面会自动重置回初始状态。'
+      : '勾了「上传的原文件」，之前上传过的文件都会被删掉，下次要用得重新上传。';
+  } else if (kinds.includes('outputs')) {
+    warnText = '「输出成品」删掉之后，之前生成的下载链接会立即失效。';
+  }
+  warn.hidden = !warnText;
+  if (warnText) {
+    warn.innerHTML = '';
+    const mark = document.createElement('span');
+    mark.className = 'mark';
+    mark.textContent = '!';
+    const text = document.createElement('span');
+    text.textContent = warnText;
+    warn.append(mark, text);
+  }
+
+  $('cacheModal').hidden = false;
+}
+
+function closeCacheModal() {
+  $('cacheModal').hidden = true;
+}
+
+async function doClearCache() {
+  const kinds = cachePickedItems().map((m) => m.kind);
+  if (!kinds.length || cacheBusy) return;
+  const hadUploads = kinds.includes('uploads');
+
+  cacheBusy = true;
+  $('cacheModalOk').disabled = true;
+  $('cacheModalOk').textContent = '正在清理…';
+
+  let ok = false;
+  let files = 0;
+  let bytes = 0;
+  try {
+    const res = await fetch('/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kinds }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `清理失败（HTTP ${res.status}）`);
+    ok = true;
+    files = data.files || 0;
+    bytes = data.bytes || 0;
+  } catch (err) {
+    toast(err.message || '清理失败', 'error');
+  }
+
+  cacheBusy = false;
+  $('cacheModalOk').disabled = false;
+  $('cacheModalOk').textContent = '确认清理';
+  if (!ok) return;
+
+  closeCacheModal();
+
+  if (kinds.includes('outputs')) {
+    // 成品已经没了，页面上那个下载链接点下去只会 404，顺手清掉
+    $('exportResult').innerHTML = '';
+    $('exportHint').textContent = '';
+  }
+
+  toast(
+    `已清理 ${files} 个文件，释放 ${formatBytes(bytes)}`
+      + (hadUploads && state.track ? '；当前这首歌已失效，页面即将重置' : ''),
+    'info',
+  );
+
+  // uploads 被清空 + 页面上正编辑着一首歌 = 那首歌彻底作废。整页重载，而不是缝缝补补 ——
+  // 否则会留下「波形还在、拍点还在、一点播放就 410」这种半死不活的状态。
+  // 没加载歌的时候没什么可重置的，刷新一下数字就够了。
+  if (hadUploads && state.track) {
+    setTimeout(() => location.reload(), 1200);
+    return;
+  }
+
+  await loadStorage();
+}
+
+$('cacheToggleBtn').addEventListener('click', () => toggleCachePanel());
+$('cacheCancel').addEventListener('click', () => toggleCachePanel(false));
+$('cachePickSafe').addEventListener('click', () => { cachePicked = new Set(CACHE_SAFE); renderCachePanel(); });
+$('cachePickAll').addEventListener('click', () => { cachePicked = new Set(CACHE_KINDS.map((m) => m.kind)); renderCachePanel(); });
+$('cachePickNone').addEventListener('click', () => { cachePicked = new Set(); renderCachePanel(); });
+$('cacheClearBtn').addEventListener('click', openCacheModal);
+$('cacheModalCancel').addEventListener('click', closeCacheModal);
+$('cacheModalOk').addEventListener('click', doClearCache);
+
+// 点遮罩和按 Esc 都能退出确认框 —— 但绝不会「点外面就默认执行」
+$('cacheModal').addEventListener('click', (e) => {
+  if (e.target === $('cacheModal')) closeCacheModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('cacheModal').hidden) closeCacheModal();
+});
+
 /* ------------------------------------------------------------ 启动自检 */
 
 fetch('/api/health')
@@ -1924,6 +2191,9 @@ fetch('/api/health')
     }
   })
   .catch(() => { /* 忽略 */ });
+
+// 顺带把 data/ 的占用拉回来，「缓存与数据」的标题栏一进页面就有数字
+loadStorage();
 
 /* 调试出口：把内部状态与渲染函数挂到 window，
    便于本地预览、截图与排查问题（不影响正常使用）。 */
@@ -1965,4 +2235,18 @@ window.__runbeat = {
   clipAnchorTime,
   repositionAfterClip,
   toggleClipPreview,
+  // 缓存与数据（测试脚本要能直接驱动面板，不想只靠点按钮）
+  CACHE_KINDS,
+  formatBytes,
+  loadStorage,
+  renderCachePanel,
+  toggleCachePanel,
+  openCacheModal,
+  closeCacheModal,
+  doClearCache,
+  cacheSnapshot: () => ({
+    report: cacheReport,
+    picked: [...cachePicked],
+    busy: cacheBusy,
+  }),
 };

@@ -82,6 +82,11 @@ class MetronomeRequest(BaseModel):
     length: float | None = Field(None, gt=0, description="截取多少秒，缺省用默认值")
 
 
+class ClearRequest(BaseModel):
+    # 类别清单由 store.CLEARABLE 定义，这里不写死具体值 —— 否则加一类要改两处。
+    kinds: list[str] = Field(..., min_length=1, description="要清理的类别")
+
+
 # --------------------------------------------------------------------------
 # 内部工具
 # --------------------------------------------------------------------------
@@ -157,7 +162,13 @@ def _beats_for(record: dict, bpm: float) -> dict:
     cache = dict(record.get("beats_cache") or {})
     entry = cache.get(key)
     if entry is None:
-        info = audio.analyze(Path(record["analysis_path"]), buckets=0, forced_bpm=bpm)
+        analysis = Path(record["analysis_path"])
+        if not analysis.is_file():
+            # 分析文件被「清缓存」删掉了（那是唯一用到它的地方）—— 从原文件重建，
+            # 而不是直接抛错。不重建的话，用户换一个候选 BPM 就会撞上 500
+            # 「拍点计算失败」，看着像功能坏了，其实只是少了个随时能重算的中间文件。
+            audio.to_analysis_wav(Path(record["source_path"]), analysis)
+        info = audio.analyze(analysis, buckets=0, forced_bpm=bpm)
         entry = {
             "beats": info["beats"],
             "beat_count": info["beat_count"],
@@ -192,6 +203,27 @@ async def health() -> dict:
         "output": audio.output_settings()[1],
         "store": store.stats(),
     }
+
+
+@app.get("/api/storage")
+async def storage() -> dict:
+    """各数据目录的文件数与占用字节，供「缓存与数据」面板显示。"""
+    return store.storage_report()
+
+
+@app.post("/api/cache/clear")
+async def cache_clear(req: ClearRequest) -> dict:
+    """按类别删除运行时文件。
+
+    删除**不可恢复**，所以界面那边必须走完二次确认才调到这里。这里是最后
+    一道闸：只认 ``store.CLEARABLE`` 里登记过的类别，别的字符串一律 400 ——
+    不能让接口变成一个「传个路径就删」的口子。
+    """
+    unknown = [k for k in req.kinds if k not in store.CLEARABLE_KINDS]
+    if unknown:
+        raise HTTPException(400, f"未知的清理类别：{', '.join(unknown)}")
+    # 一次清掉上百个文件是纯 IO 阻塞，丢线程池里跑，别卡住事件循环
+    return await run_in_threadpool(store.clear, req.kinds)
 
 
 @app.post("/api/upload")
