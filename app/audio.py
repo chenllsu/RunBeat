@@ -170,6 +170,194 @@ def _bpm_candidates(bpm: float) -> list[float]:
     return result
 
 
+def _onset_times(env: np.ndarray, hop: int, sr: int) -> np.ndarray:
+    """把起音包络的峰挑成**离散的起音时刻**（秒）。
+
+    裁决要的是「这里有没有一下」，而不是「这里的包络有多高」—— 后者的衰减尾巴
+    会让越密的网格越占便宜，正是半速误判绕不开的坑。
+    """
+    import librosa  # noqa: PLC0415
+
+    if env.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    frames = librosa.onset.onset_detect(
+        onset_envelope=env,
+        sr=sr,
+        hop_length=hop,
+        units="frames",
+        backtrack=False,
+    )
+    return np.asarray(frames, dtype=np.float64) * (hop / float(sr))
+
+
+def _match_rate(a: np.ndarray, b: np.ndarray, tol: float) -> float:
+    """``a`` 里的点有多少能在 ``b`` 里找到相距 ``tol`` 以内的同伴。"""
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    pos = np.searchsorted(b, a)
+    hit = np.zeros(a.size, dtype=bool)
+    for shift in (-1, 0):        # 插入点的左右两侧各看一个
+        idx = np.clip(pos + shift, 0, b.size - 1)
+        hit |= np.abs(a - b[idx]) <= tol
+    return float(hit.mean())
+
+
+def _grid_fit(
+    grid_times: np.ndarray, onsets: np.ndarray, tol: float
+) -> tuple[float, float, float]:
+    """网格对离散起音的 ``(精确率, 召回率, F1)``。
+
+    精确率防止「乱撒点」（撒得越密越容易碰中）；召回率防止「漏拍」（点太稀）。
+    两个一起看，BPM 猜高猜低都会掉分，也就不再偏向任何一侧。
+    """
+    if grid_times.size == 0:
+        return 0.0, 0.0, 0.0
+    precision = _match_rate(grid_times, onsets, tol)
+    recall = _match_rate(onsets, grid_times, tol)
+    if precision + recall <= 0.0:
+        return precision, recall, 0.0
+    return precision, recall, 2.0 * precision * recall / (precision + recall)
+
+
+def _adjudicate_bpm(
+    env: np.ndarray,
+    hop: int,
+    sr: int,
+    candidates: list[float],
+    base_bpm: float,
+) -> tuple[float, float, str]:
+    """用音频本身给 BPM 候选当裁判，专治半速 / 倍速误判。
+
+    librosa 的自相关只能给出「T、2T、4T 都有峰」的一堆候选，最后由一个以 120
+    为中心的先验挑一个 —— 挑错就是整体差一倍（实测《漂移》真值 184.6 被读成
+    92.3，合成 175 BPM 被读成 87.6）。这里换成让音频自己说话：把每个候选铺成
+    均匀网格，数它踩中了多少起音、又漏掉多少，取 F1 最高的那个；并且**只在明显
+    更优时才改判**（``config.ADJ_MARGIN``），避免把本来读对的曲子改坏。
+
+    返回 ``(最终 BPM, 得分, 结论)``，``结论`` 取值：
+    ``switch`` 改判 / ``keep`` 原值就是最优 / ``keep-margin`` 优势不够大，维持原值。
+    """
+    onsets = _onset_times(env, hop, sr)
+    if onsets.size < 4 or not candidates:
+        return base_bpm, 0.0, "keep"
+
+    span = float(onsets[-1]) + 1e-6
+
+    def best_fit(bpm: float) -> float:
+        period = 60.0 / bpm
+        tol = min(period * config.ADJ_TOL_RATIO, config.ADJ_TOL_SEC)
+        best = 0.0
+        # 相位要一起搜：网格整体错开半拍会让所有候选都掉分，分数就失去可比性
+        for step in range(max(1, int(config.ADJ_PHASES))):
+            grid = np.arange(period * step / float(config.ADJ_PHASES), span, period)
+            f1 = _grid_fit(grid, onsets, tol)[2]
+            if f1 > best:
+                best = f1
+        return best
+
+    scored: list[tuple[float, float]] = []
+    for bpm in candidates:
+        if bpm <= 0 or not np.isfinite(bpm):
+            continue
+        scored.append((float(bpm), best_fit(float(bpm))))
+
+    if not scored:
+        return base_bpm, 0.0, "keep"
+
+    best_bpm, best_score = max(scored, key=lambda kv: kv[1])
+    base_score = next(
+        (s for b, s in scored if abs(b - base_bpm) <= 0.15), 0.0
+    )
+
+    if abs(best_bpm - base_bpm) <= 0.15:
+        return base_bpm, base_score, "keep"
+    if best_score <= base_score * config.ADJ_MARGIN:
+        return base_bpm, base_score, "keep-margin"
+    return best_bpm, best_score, "switch"
+
+
+def _fit_period(
+    beats: list[float] | np.ndarray,
+) -> tuple[float, float, float]:
+    """用拍点序列拟合出**精确的节拍周期**，返回 ``(周期, 首拍截距, 残差标准差)``。
+
+    为什么不能直接用 ``beat_track`` 返回的 tempo：那个值是被量化过的，只能落在
+    ``60 * sr / (hop * L)`` 这张网格上。实测《漂移》真值 322.589 ms，它给出
+    325.027 ms（差 0.76%）—— 拿它铺一条 4 分钟的均匀网格，到曲末已经漂了
+    1.8 秒，网格后半段和鼓点完全错开（贴合度 3.77x → 1.06x，等于随机落点）。
+
+    拍点序列自己就带着「整首歌一共走了多长时间」这个信息，最小二乘拟合能跳出
+    量化网格，精度提高一个数量级。中间迭代剔除残差大的点：漏拍 / 跳拍会让它后面
+    所有点的序号错位，不剔掉会把斜率整个带偏。
+
+    ``残差标准差`` 顺便成了「这首曲子的鼓点规不规则」的度量 —— 很小说明速度恒定，
+    均匀网格很合适；偏大说明曲子在飘（现场版 / 渐快渐慢），那是曲子本身的问题。
+    """
+    arr = np.asarray(beats, dtype=np.float64).ravel()
+    if arr.size < 4:
+        return 0.0, 0.0, 0.0
+
+    idx = np.arange(arr.size, dtype=np.float64)
+    slope, intercept = np.polyfit(idx, arr, 1)
+    for _ in range(max(0, config.GRID_FIT_ROUNDS)):
+        resid = arr - (slope * idx + intercept)
+        keep = np.abs(resid) <= config.GRID_FIT_SIGMA * float(resid.std())
+        if keep.all() or int(keep.sum()) < 4:
+            break
+        slope, intercept = np.polyfit(idx[keep], arr[keep], 1)
+
+    resid = arr - (slope * idx + intercept)
+    return float(slope), float(intercept), float(resid.std())
+
+
+def _uniform_grid(
+    env: np.ndarray,
+    hop: int,
+    sr: int,
+    period: float,
+    duration: float,
+) -> tuple[np.ndarray, float, float]:
+    """铺一条**严格等间隔**的拍点网格，返回 ``(网格点, 贴合度, 最佳相位)``。
+
+    网格只有一个自由参数：整体相位 —— 搜 ``config.GRID_PHASES`` 档，取「网格点处
+    起音强度平均最大」的那一档。**间隔永远等于 ``period``，绝不为了贴某个鼓点让步。**
+
+    这是和「逐点吸附」最本质的区别。吸附把每个点独立挪到最近的峰上，看起来每个点
+    都更准了，代价是间隔被拉扯得忽长忽短（实测 CV 2.8% → 4.9%、max 380 → 454 ms）。
+    跟着跑的节拍必须稳 —— 忽快忽慢比落不准更难受，所以宁可整体相位差几毫秒，
+    也要保证每一格的间隔完全一致。
+
+    ``贴合度`` = 网格点处的平均起音强度 ÷ 全曲平均起音强度。1.0 左右说明这条网格
+    和鼓点无关（等于随机落点），3 以上说明踩得相当准。
+    """
+    n = env.size
+    if period <= 1e-3 or n < 4 or duration <= period:
+        return np.asarray([], dtype=np.float64), 0.0, 0.0
+
+    frame_dt = hop / float(sr)
+    mean_all = float(env.mean()) + 1e-9
+    steps = max(1, int(config.GRID_PHASES))
+
+    best_hit = -1.0
+    best_phase = 0.0
+    for i in range(steps):
+        phase = period * i / float(steps)
+        idx = np.rint(np.arange(phase, duration, period) / frame_dt).astype(np.int64)
+        idx = idx[(idx >= 0) & (idx < n)]
+        if idx.size == 0:
+            continue
+        hit = float(env[idx].mean())
+        if hit > best_hit:
+            best_hit, best_phase = hit, phase
+
+    if best_hit < 0.0:
+        return np.asarray([], dtype=np.float64), 0.0, 0.0
+
+    grid = np.arange(best_phase, duration, period)
+    return grid, best_hit / mean_all, best_phase
+
+
 def _peaks_from(y: np.ndarray, buckets: int) -> list[int]:
     """把整条波形压成固定数量的峰值（0~1000），供前端画示波器。
 
@@ -244,7 +432,12 @@ def analyze(
     检测前会掐掉首尾静音，所以必须把掐掉的偏移补回去 —— 否则拍点画到原始波形上
     会整体错位，看着像「轻微没对齐」，比明显错位更容易误导人。
 
+    自动检测这条路会多走两道工序（详见 ``_adjudicate_bpm`` / ``_fit_period``）：
+    先用音频给半速 / 倍速候选裁决一次，再用拍点序列拟合出精确周期、铺一条
+    **严格等间隔**的均匀网格。``bpm_raw`` / ``adjudicated`` 记录裁决前后的差别。
+
     ``forced_bpm`` 用来按用户指定的 BPM 重新生成拍点（候选值切换 / 手动修正）。
+    给了它就跳过裁决 —— 用户可能正是在纠正检测，不该被算法改回去；网格照铺。
     """
     import librosa  # 首次导入较慢，放在函数内延迟加载
 
@@ -266,44 +459,96 @@ def analyze(
     # 从头逐帧扫到第一个超过阈值的帧，把这段里的拍点全部抹掉。节奏偏轻的前奏
     # 因此会整段丢拍点（实测一个 0.5 秒静音 + 均匀点击的样本，开头 3 秒被清空）。
     # 音频级的静音修剪上面已经做过了，这里不需要它再裁一次。
+    hop = config.ANALYSIS_HOP
     tempo, frames = librosa.beat.beat_track(
         y=y,
         sr=sr,
-        hop_length=config.ANALYSIS_HOP,
+        hop_length=hop,
         start_bpm=120.0,
         bpm=forced_bpm,
         trim=False,
     )
     bpm = float(np.atleast_1d(tempo)[0])
+    bpm_raw = bpm
 
-    times = librosa.frames_to_time(frames, sr=sr, hop_length=config.ANALYSIS_HOP)
-    detected = [round(float(t) + offset, 3) for t in np.atleast_1d(times)]
-
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=config.ANALYSIS_HOP)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     if onset_env.size:
         clarity = float(onset_env.max() / (onset_env.mean() + 1e-9))
     else:
         clarity = 1.0
 
-    # 拍点间隔的相对波动，只看检测到的那些（补边是均匀的，会把波动冲淡）。
-    # 检测「准不准」和检测「稳不稳」是两件事：速度飘忽的曲子（现场版 / 古典）
-    # 本身就不存在唯一 BPM。
-    if len(detected) >= 3:
-        gaps = np.diff(np.asarray(detected, dtype=np.float64))
-        interval_cv = float(np.std(gaps) / (float(np.mean(gaps)) + 1e-9))
-    else:
-        interval_cv = 0.0
+    # ---- 用音频给候选当裁判，压掉半速 / 倍速误判。
+    # 用户手动填了 BPM 就直接听他的，不再自作主张改判（他可能就是在纠正检测）。
+    verdict = "user" if forced_bpm is not None else "keep"
+    adj_score = 0.0
+    if forced_bpm is None:
+        chosen, adj_score, verdict = _adjudicate_bpm(
+            onset_env, hop, sr, _bpm_candidates(bpm), bpm
+        )
+        if verdict == "switch":
+            tempo, frames = librosa.beat.beat_track(
+                y=y,
+                sr=sr,
+                hop_length=hop,
+                start_bpm=120.0,
+                bpm=chosen,
+                trim=False,
+            )
+            bpm = float(np.atleast_1d(tempo)[0])
+
+    times = librosa.frames_to_time(frames, sr=sr, hop_length=hop)
+    raw_times = [round(float(t) + offset, 3) for t in np.atleast_1d(times)]
+
+    # ---- 拍点走严格等间隔的均匀网格，周期由 DP 拍点拟合出来（详见 _fit_period）。
+    # 为什么要拟合而不是直接用 beat_track 的 tempo，见 _fit_period 的 docstring。
+    fit_period, _fit_phase, fit_resid = _fit_period(
+        np.asarray(raw_times, dtype=np.float64) - offset
+    )
+    if not np.isfinite(fit_period) or fit_period <= 0.01:
+        # 拍点太少（极短的片段 / 起音极弱）—— 没有拟合的余地，退回 beat_track 的 tempo
+        fit_period = 60.0 / max(bpm, 1e-6)
+        fit_resid = 0.0
+
+    grid_trim, grid_hit, grid_phase = _uniform_grid(
+        onset_env, hop, sr, fit_period, y.size / float(sr)
+    )
+    detected = [round(float(t) + offset, 3) for t in grid_trim]
+    if not detected:
+        detected = list(raw_times)
+
+    # 「BPM」必须和网格周期自洽 —— 倍率换算是拿它算的，不一致实际步频就会偏。
+    # 注意这里是**拟合值**（《漂移》184.6 → 186.0），比 beat_track 的 tempo 更接近真值。
+    bpm = 60.0 / fit_period
+
+    # 拍点间隔的相对波动，走的是**DP 拍点**。最终网格是严格等间隔的、CV 恒等于 0，
+    # 没有信息量；这个数回答的是另一件事 ——「这首曲子的速度稳不稳」。速度飘忽的
+    # 曲子（现场版 / 古典）本身就不存在唯一 BPM，grid_fit_resid 也一起说明这件事。
+    def _cv(values: list[float]) -> float:
+        if len(values) < 3:
+            return 0.0
+        gaps = np.diff(np.asarray(values, dtype=np.float64))
+        return float(np.std(gaps) / (float(np.mean(gaps)) + 1e-9))
+
+    interval_cv = _cv(raw_times)
 
     grid = _extend_beat_grid(detected, duration, bpm)
 
     return {
         "bpm": round(bpm, 1),
+        "bpm_raw": round(bpm_raw, 1),
+        "adjudicated": verdict,
         "candidates": _bpm_candidates(bpm),
         "clarity": round(clarity, 2),
         "beats": grid,
         "beat_count": len(grid),
         "detected_count": len(detected),
+        # interval_cv 走 DP 拍点（曲子的速度稳不稳）；grid_* 说明最终那条网格的情况
         "interval_cv": round(interval_cv, 4),
+        "grid_period": round(fit_period, 6),
+        "grid_phase": round(grid_phase + offset, 3),
+        "grid_hit": round(grid_hit, 2),
+        "grid_fit_resid": round(fit_resid, 4),
+        "adjudicate_score": round(adj_score, 4),
         "trim_offset": round(offset, 3),
         "peaks": _peaks_from(y_raw, buckets),
     }

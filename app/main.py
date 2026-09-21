@@ -304,6 +304,10 @@ async def upload(file: UploadFile = File(...)) -> dict:
             "sample_rate": info.sample_rate,
             "codec": info.codec,
             "bpm": detected["bpm"],
+            # 裁决前的原始检测值。和 bpm 不一致就说明「半速 / 倍速误判」被自动纠正过，
+            # 排查「为什么检测出的 BPM 和我印象里不一样」时全靠它。
+            "bpm_raw": detected["bpm_raw"],
+            "adjudicated": detected["adjudicated"],
             "candidates": detected["candidates"],
             "clarity": detected["clarity"],
             "interval_cv": detected["interval_cv"],
@@ -327,10 +331,18 @@ async def upload(file: UploadFile = File(...)) -> dict:
         "sample_rate": info.sample_rate,
         "codec": info.codec,
         "detected_bpm": detected["bpm"],
+        "detected_bpm_raw": detected["bpm_raw"],
+        "adjudicated": detected["adjudicated"],
         "bpm_candidates": detected["candidates"],
         "clarity": detected["clarity"],
         "beat_count": detected["beat_count"],
         "interval_cv": detected["interval_cv"],
+        # 均匀网格的两个诊断值。grid_hit = 网格点处的平均起音强度 ÷ 全曲平均，
+        # 1.0 左右等于随机落点、3 以上算踩得准；grid_fit_resid 是拍点相对拟合
+        # 直线的残差，偏大说明这首曲子在飘（现场版 / 渐快），均匀网格对这类
+        # 曲子的贴合度天然会低一些 —— 但节拍稳仍然是用户要的。
+        "grid_hit": detected["grid_hit"],
+        "grid_fit_resid": detected["grid_fit_resid"],
         "source_url": f"/media/source/{source_path.name}",
         "defaults": {
             "spm": config.SPM_DEFAULT,

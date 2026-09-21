@@ -72,12 +72,91 @@ def main() -> int:
     analysis = audio.to_analysis_wav(src, workdir / "analysis.wav")
     detected = audio.detect_bpm(analysis)
     print(f"检测 BPM   : {detected['bpm']}  (真值 120.0)")
+    print(f"原始检测值 : {detected['bpm_raw']}   裁决结论: {detected['adjudicated']}")
     print(f"候选值     : {detected['candidates']}")
     print(f"清晰度     : {detected['clarity']}")
     if abs(detected["bpm"] - 120.0) > 2.0:
         failures.append(f"BPM 检测偏差过大：期望约 120，实际 {detected['bpm']}")
+    # 这条是回归闸：本来就读对的曲子，裁决**不许**自作聪明改掉
+    if detected["adjudicated"] not in ("keep", "keep-margin"):
+        failures.append(
+            f"120 BPM 的干净样本被裁决改判了：{detected['bpm_raw']} -> {detected['bpm']}"
+            f"（{detected['adjudicated']}）"
+        )
 
-    section("4. 步频 -> 倍率 换算")
+    section("4. BPM 半速 / 倍速裁决")
+    # 真值越接近 120 的自相关先验，librosa 越容易只读到它的一半 —— 175 / 184.6
+    # 这些「跑者常用步频」正是重灾区（实测分别被读成 87.6 / 92.3）。
+    # 裁决的目标不是「永远改判」，而是**最终值要回到真值附近**。
+    adj_cases = [100.0, 120.0, 140.0, 160.0, 175.0, 184.6]
+    for truth in adj_cases:
+        sample = workdir / f"adj_{truth}.wav"
+        make_click_track(sample, truth, 20.0)
+        ana = audio.to_analysis_wav(sample, workdir / f"adj_ana_{truth}.wav")
+        got = audio.analyze(ana, buckets=0)
+        err = abs(got["bpm"] - truth)
+        ok = err <= 3.0
+        print(
+            f"  [{'OK ' if ok else 'BAD'}] 真值 {truth:>5.1f} | 检测 {got['bpm_raw']:>5.1f} "
+            f"-> 裁决 {got['bpm']:>5.1f} ({got['adjudicated']:<12}) 误差 {err:.1f}"
+        )
+        if not ok:
+            failures.append(
+                f"BPM 裁决没能修正半速误判：真值 {truth}，检测 {got['bpm_raw']}，"
+                f"裁决后 {got['bpm']}"
+            )
+
+    section("5. 均匀网格（周期拟合 + 相位搜索）")
+    # 拍点走严格等间隔的网格。三条断言：
+    #   ① 间隔**严格**相等 —— 跟着跑的节拍必须稳，这是整个改动的目的
+    #   ② 相位搜索能把网格整体对齐到鼓点上
+    #   ③ 周期拟合比 beat_track 的 tempo 准（tempo 被量化过，会累积漂移）
+    grid_sample = workdir / "grid_120.wav"
+    make_click_track(grid_sample, 120.0, 20.0)
+    grid_ana = audio.to_analysis_wav(grid_sample, workdir / "grid_analysis.wav")
+
+    gy, gsr = librosa.load(str(grid_ana), sr=config.ANALYSIS_SR, mono=True)
+    gy, _gtrim = librosa.effects.trim(gy, top_db=40.0)
+    genv = librosa.onset.onset_strength(y=gy, sr=gsr, hop_length=config.ANALYSIS_HOP)
+    gdur = gy.size / float(gsr)
+    gperiod = 60.0 / 120.0
+
+    ggrid, ghit, gphase = audio._uniform_grid(
+        genv, config.ANALYSIS_HOP, gsr, gperiod, gdur
+    )
+    ggaps = np.diff(np.asarray(ggrid, dtype=np.float64))
+    spread = float(np.max(np.abs(ggaps - gperiod))) * 1000 if ggaps.size else -1.0
+    flat_ok = bool(ggaps.size >= 10 and spread < 1e-6)
+    print(
+        f"  间隔严格相等：{ggaps.size} 个间隔，最大偏离周期 {spread:.9f} ms  "
+        f"{'OK ' if flat_ok else 'BAD'}"
+    )
+    if not flat_ok:
+        failures.append(f"均匀网格的间隔不是严格相等的，最大偏离 {spread:.6f} ms")
+
+    # 合成鼓点落在 i*period 上，所以网格相位对 period 取模应该回到 0 附近
+    rest = float(gphase) % gperiod
+    phase_err = min(rest, gperiod - rest) * 1000
+    phase_ok = phase_err < 20.0
+    print(
+        f"  相位对齐鼓点：偏差 {phase_err:.1f} ms（允许 20 ms），贴合度 {ghit:.2f}x  "
+        f"{'OK ' if phase_ok else 'BAD'}"
+    )
+    if not phase_ok:
+        failures.append(f"均匀网格的相位没对齐到鼓点：偏差 {phase_err:.1f} ms")
+
+    ginfo = audio.analyze(grid_ana, buckets=0)
+    pf = float(ginfo["grid_period"])
+    perr = abs(pf - gperiod) / gperiod * 100
+    period_ok = perr < 0.5
+    print(
+        f"  周期拟合：{pf*1000:.4f} ms（真值 {gperiod*1000:.4f} ms）误差 {perr:.3f}%，"
+        f"bpm {ginfo['bpm']}  {'OK ' if period_ok else 'BAD'}"
+    )
+    if not period_ok:
+        failures.append(f"周期拟合偏差过大：{pf*1000:.4f} ms vs 真值 {gperiod*1000:.4f} ms")
+
+    section("6. 步频 -> 倍率 换算")
     cases = [
         # (原曲BPM, 目标步频, 换算, min, max, 期望倍率)
         (120.0, 130.0, "1:1", 0.85, 1.15, 1.083333),
@@ -98,7 +177,7 @@ def main() -> int:
         if not ok:
             failures.append(f"倍率换算错误：{source_bpm}/{spm}/{mapping} -> {plan.ratio}，期望 {expect}")
 
-    section("5. 时间伸缩 + 结果复检")
+    section("7. 时间伸缩 + 结果复检")
     plans = [
         (120.0, 130.0, "1:1"),   # 范围内的正常变速
         (120.0, 170.0, "1:1"),   # 会被截断到 1.15x
@@ -127,7 +206,7 @@ def main() -> int:
         if not bpm_ok:
             failures.append(f"变速后 BPM 不对：{out_bpm}，期望 {expected_bpm:.1f}")
 
-    section("6. 片段截取（预览）")
+    section("8. 片段截取（预览）")
     clip = workdir / f"clip{ext}"
     audio.render(src, clip, 1.10, start=8.0, length=6.0)
     clip_info = audio.probe(clip)
@@ -140,7 +219,7 @@ def main() -> int:
     if not ok:
         failures.append(f"片段时长不对：{clip_info.duration:.2f}s，期望 {expected_clip:.2f}s")
 
-    section("7. 节拍声：先变速再打点，位置对不对")
+    section("9. 节拍声：先变速再打点，位置对不对")
     # ---- 纯换算：成品时间轴上 click 应该正好落在「拍点 ÷ 倍率」处
     ratio = 1.10
     beats = detected["beats"]
@@ -207,7 +286,7 @@ def main() -> int:
         )
     print(f"  click 落在变速后的拍点位置上：{'OK ' if aligned else 'BAD'}")
 
-    section("8. mp3 输出可解码性")
+    section("10. mp3 输出可解码性")
     produced = sorted(workdir.glob(f"out_*{ext}"))
     if not produced:
         failures.append("没有找到任何导出产物")
