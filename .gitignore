@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+data/uploads/*
+data/analysis/*
+data/previews/*
+data/outputs/*
+!data/uploads/.gitkeep
+!data/analysis/.gitkeep
+!data/previews/.gitkeep
+!data/outputs/.gitkeep

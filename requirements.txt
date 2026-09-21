@@ -1,0 +1,14 @@
+# RunBeat —— 跑步步频音乐生成器
+# Python 3.13 / 64 位
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# 音频分析与处理
+librosa>=0.10.2
+numpy>=1.26
+soundfile>=0.12
+
+# 自带 ffmpeg 二进制，无需手动安装 ffmpeg
+imageio-ffmpeg>=0.5

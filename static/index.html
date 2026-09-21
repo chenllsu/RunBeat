@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RunBeat · 把任何一首歌改成你的步频</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1>Run<span>Beat</span></h1>
+    <p>上传一首歌，改成你的目标步频 —— 速度跟着脚步走，音高不变。</p>
+  </header>
+
+  <!-- ============================== 上传 -->
+  <div class="dropzone" id="dropzone">
+    <div class="big">把音频文件拖到这里</div>
+    <div class="sub">或点击选择 · mp3 / wav / m4a / flac · 最大 20 MB、10 分钟</div>
+  </div>
+  <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" hidden>
+
+  <div id="panel" hidden>
+
+    <!-- ============================ 1 原曲节奏 -->
+    <section class="card">
+      <h2><span class="idx">1</span>原曲节奏
+        <span class="live-dot" id="beatDot" hidden><i></i>正在播放</span>
+      </h2>
+
+      <div class="track">
+        <div style="min-width:0">
+          <div class="name" id="trackName">—</div>
+          <div class="meta" id="trackMeta">—</div>
+        </div>
+        <button class="btn ghost" id="changeFileBtn" type="button">换一首</button>
+      </div>
+
+      <!-- 检测结果：主数字 + 可信度 -->
+      <div class="beat-head">
+        <div class="beat-num">
+          <span class="v" id="bpmBig">—</span>
+          <span class="u">BPM</span>
+        </div>
+        <div class="beat-conf">
+          <div class="conf-bars" id="confBars"><i></i><i></i><i></i></div>
+          <div class="conf-text" id="confText">读取中…</div>
+        </div>
+      </div>
+
+      <!-- 候选值与手动修正 -->
+      <div class="beat-cands">
+        <div class="cands-label">
+          点一下换一组拍点 —— 检测有时会把节拍翻倍或减半，看着波形就知道哪组对
+        </div>
+        <div class="chips" id="bpmChips"></div>
+        <div class="beat-manual">
+          <span>都不对？手动改成</span>
+          <input type="number" id="bpmInput" step="0.1" min="20" max="400">
+          <span>BPM</span>
+        </div>
+      </div>
+
+      <!-- 示波器：波形 + 拍点线 + 播放头 -->
+      <div class="scope">
+        <div class="scope-bar">
+          <div class="scope-track"><div class="scope-fill" id="scopeFill"></div></div>
+          <div class="scope-clock"><span id="scopeClock">00:00</span><span id="scopeTotal">/ 00:00</span></div>
+        </div>
+        <div class="scope-canvas">
+          <canvas id="waveCanvas"></canvas>
+          <div class="scope-empty" id="scopeEmpty">正在读取波形…</div>
+        </div>
+        <div class="scope-foot">
+          <span class="scope-stat" id="beatStat">—</span>
+          <button class="btn ghost" id="metroBtn" type="button">
+            <span class="btn-label">听节拍对齐</span>
+          </button>
+        </div>
+        <div class="scope-legend">
+          <span class="lg lg-wave"><i></i>波形</span>
+          <span class="lg lg-beat"><i></i>检测到的拍点</span>
+          <span class="lg lg-head"><i></i>播放位置</span>
+        </div>
+      </div>
+
+      <div class="verdict" id="verdict">—</div>
+    </section>
+
+    <!-- ============================ 2 裁剪区间 -->
+    <section class="card">
+      <h2><span class="idx">2</span>裁剪区间
+        <span class="clip-state" id="clipState">整首</span>
+      </h2>
+      <div class="hint" style="margin-top:0">
+        拖动波形上的两个手柄选一段，试听和生成的都只有这一段。不选就是整首。
+      </div>
+
+      <div class="clip-canvas">
+        <canvas id="clipCanvas"></canvas>
+        <div class="clip-empty" id="clipEmpty">正在读取波形…</div>
+      </div>
+
+      <div class="clip-row">
+        <span class="clip-lab">从</span>
+        <input type="text" id="clipStart" class="clip-time" value="00:00" inputmode="numeric" spellcheck="false">
+        <span class="clip-lab">到</span>
+        <input type="text" id="clipEnd" class="clip-time" value="00:00" inputmode="numeric" spellcheck="false">
+        <span class="clip-len" id="clipLength">—</span>
+        <button class="btn ghost" id="clipResetBtn" type="button">还原整首</button>
+      </div>
+
+      <div class="clip-row">
+        <button class="btn primary" id="clipPreviewBtn" type="button">
+          <span class="btn-label">试听这段</span>
+        </button>
+        <span class="clip-tip" id="clipTip">—</span>
+      </div>
+
+      <div class="hint">
+        松手时起止点会对准最近的鼓点（最多挪半拍）。改起点就从新起点开始听，
+        改终点自动跳到终点前 5 秒，专门听收尾接得顺不顺。
+      </div>
+    </section>
+
+    <!-- ============================ 3 目标步频 -->
+    <section class="card">
+      <h2><span class="idx">3</span>目标步频</h2>
+
+      <div class="control">
+        <div class="control-head">
+          <span class="label">每分钟步数</span>
+          <span class="value"><span id="spmValue">170</span> spm</span>
+        </div>
+        <input type="range" id="spmRange" min="120" max="220" step="1" value="170">
+      </div>
+
+      <div class="control">
+        <div class="control-head"><span class="label">换算方式</span></div>
+        <div class="segmented" id="mappingGroup">
+          <button type="button" data-mapping="1:1" class="active">1:1 每步踩一拍</button>
+          <button type="button" data-mapping="1:2">1:2 每两步踩一拍</button>
+        </div>
+        <div class="hint" id="mappingHint"></div>
+      </div>
+
+      <div class="control">
+        <div class="control-head">
+          <span class="label">允许的变速范围</span>
+        </div>
+        <div class="bpm-row">
+          <input type="number" id="minRatio" step="0.01" min="0.25" max="4" value="0.85">
+          <span style="color:var(--dim)">~</span>
+          <input type="number" id="maxRatio" step="0.01" min="0.25" max="4" value="1.15">
+          <button class="btn ghost" id="resetRatioBtn" type="button">恢复默认</button>
+        </div>
+        <div class="hint">超出范围的调整会被截到边界，并告诉你实际生成的是多少步频。</div>
+      </div>
+
+      <div class="status" id="status">
+        <div class="line1">
+          <span id="ratioText">×1.000</span>
+          <span class="badge green" id="naturalBadge">舒适</span>
+        </div>
+        <div class="line2" id="statusDetail">—</div>
+      </div>
+    </section>
+
+    <!-- ============================ 4 试听 -->
+    <section class="card">
+      <h2><span class="idx">4</span>试听</h2>
+
+      <div class="player">
+        <button class="btn primary" id="playLiveBtn" type="button">
+          <span class="btn-label">试听</span>
+        </button>
+        <button class="btn ghost" id="stopBtn" type="button">停止</button>
+      </div>
+
+      <div class="seek-wrap">
+        <input type="range" id="seek" min="0" max="1000" step="1" value="0">
+        <div class="seek-meta">
+          <span id="seekTime">00:00</span>
+          <span id="seekTotal">00:00</span>
+        </div>
+      </div>
+
+      <label class="checkline">
+        <input type="checkbox" id="keepPitch" checked>
+        试听时保持音高（更接近成品，但浏览器算法音质略糙）
+      </label>
+
+      <label class="checkline">
+        <input type="checkbox" id="previewMetro">
+        <strong>试听时</strong>叠加节拍声（拖动步频时跟着一起变，用来确认节拍踩得准不准）
+      </label>
+
+      <div class="metro-vol" id="metroVolRow" hidden>
+        <span class="vol-label">节拍声大小</span>
+        <input type="range" id="metroGain" min="0" max="100" step="1" value="50">
+        <span class="vol-value" id="metroGainText">50%</span>
+      </div>
+
+      <div class="now-playing" id="nowPlaying" hidden>
+        <span class="tag" id="nowPlayingTag">—</span>
+        <span class="beat-pulse" id="beatPulse" hidden title="每响一下节拍声，这里就闪一下"></span>
+        <span class="meta" id="nowPlayingInfo"></span>
+      </div>
+    </section>
+
+    <!-- ============================ 5 生成下载 -->
+    <section class="card">
+      <h2><span class="idx">5</span>生成下载</h2>
+      <div class="hint" style="margin-top:0">
+        这里的试听是浏览器实时变速，音质会略糙一点。点下面的按钮会把<strong>选中的这段</strong>
+        用服务端算法完整渲染一遍，<strong>音质更好</strong>，可以直接下载。
+      </div>
+
+      <label class="checkline">
+        <input type="checkbox" id="exportMetro">
+        <strong>导出时</strong>叠加节拍声（<strong>只影响下载的文件，试听不受影响</strong>）
+      </label>
+      <div class="hint" id="exportMetroHint"></div>
+
+      <div class="export-row">
+        <button class="btn primary" id="exportBtn" type="button">
+          <span class="btn-label">生成完整文件</span>
+        </button>
+        <span class="hint" style="margin:0" id="exportHint"></span>
+      </div>
+      <div id="exportResult"></div>
+    </section>
+
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <footer class="foot">
+    文件只在本机处理与保存，6 小时后自动清理。<br>
+    请仅处理你有权使用的音频。
+  </footer>
+</div>
+
+<audio id="liveAudio" class="audio-host" preload="metadata"></audio>
+<audio id="metroAudio" class="audio-host" preload="auto"></audio>
+<script src="/app.js"></script>
+</body>
+</html>
