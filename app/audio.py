@@ -170,12 +170,206 @@ def _bpm_candidates(bpm: float) -> list[float]:
     return result
 
 
-def _onset_times(env: np.ndarray, hop: int, sr: int) -> np.ndarray:
-    """把起音包络的峰挑成**离散的起音时刻**（秒）。
+def _fold_bpm(bpm: float) -> float:
+    """把候选 BPM 折叠到 :data:`config.FOLD_CENTER` 附近（2^k 倍里取最近的）。
 
-    裁决要的是「这里有没有一下」，而不是「这里的包络有多高」—— 后者的衰减尾巴
-    会让越密的网格越占便宜，正是半速误判绕不开的坑。
+    自相关对 T、2T、4T 都会有峰，直接拿峰对应的 BPM 投票，半速 / 倍速会各拉一票。
+    折叠之后它们落回同一个值，票数才能聚到一起。范围 20~400，跟竞品一致。
     """
+    if bpm <= 0 or not np.isfinite(bpm):
+        return 0.0
+    center = config.FOLD_CENTER
+    best = bpm
+    best_d = abs(bpm - center)
+    v = bpm
+    for _ in range(10):
+        v /= 2.0
+        if v < 20.0:
+            break
+        d = abs(v - center)
+        if d < best_d:
+            best, best_d = v, d
+    v = bpm
+    for _ in range(10):
+        v *= 2.0
+        if v > 400.0:
+            break
+        d = abs(v - center)
+        if d < best_d:
+            best, best_d = v, d
+    return best
+
+
+def _cluster_vote(items: list[tuple[float, float]]) -> list[list[float]]:
+    """聚类投票。``items`` 是 ``(BPM, 权重)``，返回 ``[代表BPM, 权重和]`` 按权重降序。
+
+    权重只决定簇的代表（先进簇的是权重最高的）；票值按竞品做法聚类（相差
+    ``config.VOTE_TOL`` 以内合并），但**累加的是权重而不是个数** —— 峰的强弱
+    本身就是证据，纯计票会把「一个强峰 + 一个弱峰」和「两个噪声峰」当成
+    同样的两票，实测 150 BPM 样本的真值峰（权重 1600+）就是这样被
+    伪峰（权重 680）以票数挤掉的。平票时代表与 120 更近的排前面。
+    """
+    clusters: list[list[float]] = []
+    for bpm, w in sorted(items, key=lambda t: -t[1]):
+        if bpm <= 0:
+            continue
+        for c in clusters:
+            ratio = max(bpm, c[0]) / min(bpm, c[0])
+            if abs(ratio - 1.0) < config.VOTE_TOL:
+                c[1] += max(w, 0.0)
+                break
+        else:
+            clusters.append([bpm, max(w, 0.0)])
+    clusters.sort(key=lambda c: (-c[1], abs(c[0] - config.FOLD_CENTER)))
+    return clusters
+
+
+def _autocorr_pearson(x: np.ndarray) -> np.ndarray:
+    """归一化自相关（Pearson 修正），FFT 实现。
+
+    竞品的写法是分母除以 ``sqrt(var_前段 × var_后段) × (N-lag)``，等价于把每个
+    lag 的重合段当成两条独立序列算相关系数 —— 修掉了「短 lag 重合样本少、
+    乘积天然偏大」的统计偏置。这里用累积平方和把 O(N²) 压到 O(N log N)。
+    """
+    n = x.size
+    out = np.zeros(n, dtype=np.float64)
+    if n < 16:
+        return out
+    x = x - x.mean()
+    size = 1 << (2 * n - 1).bit_length()
+    spec = np.fft.rfft(x, size)
+    ac = np.fft.irfft(spec * np.conj(spec), size)[:n]
+    cs = np.concatenate(([0.0], np.cumsum(x * x)))
+    total = float(cs[n])
+    idx = np.arange(n, dtype=np.float64)
+    # sum1[i] = x[0 .. n-i-1] 的平方和；sum2[i] = x[i .. n-1] 的平方和
+    sum1 = cs[n - np.arange(n)]
+    sum2 = total - cs[:n]
+    denom = np.sqrt(np.maximum(sum1 * sum2, 0.0))
+    ok = denom > 0
+    out[ok] = ac[ok] * (n - idx[ok]) / denom[ok]
+    return out
+
+
+def _band_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
+    """STFT → 14 个频带的帧能量序列，形状 ``(带数, 帧数)``。
+
+    **逐带** z-score 归一化（每条序列除以自己的标准差）：让 hi-hat 带和
+    底鼓带一人一票，同时保留帧与帧之间的强弱差 —— 那是「哪边才是真拍」的
+    关键证据。竞品用的是逐帧跨带 L2 归一化，实测会把强弱拍的整体响度差
+    抹平（强弱击频谱相近时），自相关便分不清 T 和 T/2 哪个是拍。
+    """
+    import librosa  # noqa: PLC0415
+
+    spec = np.abs(librosa.stft(y, n_fft=config.BAND_N_FFT, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=config.BAND_N_FFT)
+    edges = [int(np.searchsorted(freqs, f)) for f in config.BAND_EDGES_HZ]
+    edges[-1] = spec.shape[0]
+
+    rows: list[np.ndarray] = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        hi = min(hi, spec.shape[0])
+        if hi - lo < 1:
+            continue
+        rows.append(spec[lo:hi].sum(axis=0))
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float64)
+
+    bands = np.asarray(rows, dtype=np.float64)
+    # 静带过滤：z-score 会把纯数值噪声的 std 放大到 1（和其他带等权），
+    # 必须在归一化**之前**用原始 std 掐掉（阈值见 config.BAND_MIN_STD_RATIO）。
+    raw_std = bands.std(axis=1)
+    keep = raw_std > max(float(raw_std.max()), 1e-12) * config.BAND_MIN_STD_RATIO
+    bands = bands[keep]
+    if bands.shape[0] == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    std = bands.std(axis=1, keepdims=True)
+    return (bands - bands.mean(axis=1, keepdims=True)) / np.maximum(std, 1e-12)
+
+
+def _band_bpm(series: np.ndarray, fps: float) -> list[tuple[float, float]]:
+    """单频带检测：自相关 → 峰 → 权重候选，返回 ``(BPM, 权重)`` 列表。
+
+    关键的三道保险（全部照抄竞品）：
+    * lag 限制在 [BPM_LO, BPM_HI] 对应的范围内 —— 搜索空间先收窄；
+    * 峰的权重乘 ``sqrt((N-lag)/N)`` —— 短 lag（高倍速）的重合样本少，天然被压低；
+    * 只取最强的 top 20% 峰 —— 弱峰多数是噪声。
+    """
+    ac = _autocorr_pearson(series)
+    n = ac.size
+    if n < 16:
+        return []
+    lo_lag = max(2, int(np.floor(fps * 60.0 / config.BPM_HI)))
+    hi_lag = min(n - 2, int(np.ceil(fps * 60.0 / config.BPM_LO)))
+    if hi_lag - lo_lag < 4:
+        return []
+    seg = ac[lo_lag : hi_lag + 1]
+
+    mean, std = float(seg.mean()), float(seg.std())
+    peaks = [i for i in range(1, seg.size - 1) if seg[i] > seg[i - 1] and seg[i] > seg[i + 1]]
+    strong = [i for i in peaks if seg[i] > mean + 0.1 * std] or peaks
+    if not strong:
+        return []
+    strong.sort(key=lambda i: float(seg[i]), reverse=True)
+    top = strong[: max(1, int(np.ceil(seg.size * 0.2)))]
+
+    out: list[tuple[float, float]] = []
+    for i in top:
+        lag = lo_lag + i
+        bpm = 60.0 * fps / lag
+        weight = float(seg[i]) * np.sqrt((n - lag) / float(n))
+        out.append((bpm, weight))
+    return out
+
+
+def _vote_candidates(
+    y: np.ndarray, sr: int, hop: int, dp_bpm: float
+) -> tuple[list[float], float, float]:
+    """多频带投票，返回 ``(终审候选池, 投票top1, top2)``。
+
+    每带内部先折叠投票出前 2 名，再跨带聚类数票。候选池 = DP 值 / 投票
+    top1 / top2 及各自的 2 倍 / 半速，全部框在 [BPM_LO, BPM_HI]。
+
+    ``dp_bpm`` 是 librosa beat_track 的结果（调用前先折叠）。它**不参与投票
+    计权** —— 实测一首 99.4 BPM 的歌，低频带（底鼓+贝斯）会齐刷刷投 132.5
+    （切分律动，权重近 5 万，是 99.4 的两倍），票选 top1 被带跑；但 DP 的全局
+    时序连贯性直接命中 99.4。所以分工是：**DP 当终审 base（锚点），投票负责
+    候选池** —— DP 犯半速错时（175 被读成 87.6），候选池里的 2 倍变体由
+    终审切回，两道证据互补。
+    """
+    bands = _band_energy(y, sr, hop)
+    fps = sr / float(hop)
+    if bands.size == 0:
+        return [], 0.0, 0.0
+
+    votes: list[tuple[float, float]] = []
+    for bi in range(bands.shape[0]):
+        cands = _band_bpm(bands[bi], fps)
+        folded = [(_fold_bpm(b), w) for b, w in cands]
+        for rep, w in _cluster_vote(folded)[:2]:
+            votes.append((rep, w))
+
+    clusters = _cluster_vote(votes)
+    tops = [c[0] for c in clusters[:2]]
+    while len(tops) < 2:
+        tops.append(0.0)
+
+    # 候选池：DP 变体排最前（base，终审平分时优先），然后投票 top1 / top2 的变体
+    pool: list[float] = []
+    for base in (dp_bpm, tops[0], tops[1]):
+        if base <= 0:
+            continue
+        for v in (base, base / 2.0, base * 2.0):
+            if (
+                config.BPM_LO - 1e-6 <= v <= config.BPM_HI + 1e-6
+                and all(abs(v - p) > 0.15 for p in pool)
+            ):
+                pool.append(v)
+    return pool, tops[0], tops[1]
+
+
+def _onset_times(env: np.ndarray, hop: int, sr: int) -> np.ndarray:
+    """把起音包络的峰挑成**离散的起音时刻**（秒）。终审的精确率用它。"""
     import librosa  # noqa: PLC0415
 
     if env.size == 0:
@@ -197,82 +391,132 @@ def _match_rate(a: np.ndarray, b: np.ndarray, tol: float) -> float:
         return 0.0
     pos = np.searchsorted(b, a)
     hit = np.zeros(a.size, dtype=bool)
-    for shift in (-1, 0):        # 插入点的左右两侧各看一个
-        idx = np.clip(pos + shift, 0, b.size - 1)
-        hit |= np.abs(a - b[idx]) <= tol
+    for shift in (-1, 0):
+        j = np.clip(pos + shift, 0, b.size - 1)
+        hit |= np.abs(a - b[j]) <= tol
     return float(hit.mean())
 
 
-def _grid_fit(
-    grid_times: np.ndarray, onsets: np.ndarray, tol: float
-) -> tuple[float, float, float]:
-    """网格对离散起音的 ``(精确率, 召回率, F1)``。
+def _is_octave(a: float, b: float) -> bool:
+    """两个 BPM 是否互为 2 倍 / 半速关系（±5% 容差）。"""
+    if a <= 0 or b <= 0:
+        return False
+    ratio = max(a, b) / min(a, b)
+    return 1.9 <= ratio <= 2.1 or 0.475 <= ratio <= 0.525
 
-    精确率防止「乱撒点」（撒得越密越容易碰中）；召回率防止「漏拍」（点太稀）。
-    两个一起看，BPM 猜高猜低都会掉分，也就不再偏向任何一侧。
+
+def _grid_quality(
+    y: np.ndarray,
+    onset_env: np.ndarray,
+    hop: int,
+    sr: int,
+    bpm: float,
+) -> float:
+    """给定 BPM 下的**精细贴合度**（倍频复核用）。
+
+    用该速度引导 beat_track 找 DP 拍点 → 最小二乘拟合出精确周期 →
+    ``_uniform_grid`` 720 档精细相位搜贴合度。粗打分（``_energy_judge``）
+    的相位只有 5ms 精度、周期未拟合，快侧网格的周期误差会随曲长累积漂移，
+    把贴合度毁掉（实测一首歌 198.8 侧粗评 1.23x、精确周期下其实 2.95x）
+    —— 所以复核必须用拟合周期加精细相位。
     """
-    if grid_times.size == 0:
-        return 0.0, 0.0, 0.0
-    precision = _match_rate(grid_times, onsets, tol)
-    recall = _match_rate(onsets, grid_times, tol)
-    if precision + recall <= 0.0:
-        return precision, recall, 0.0
-    return precision, recall, 2.0 * precision * recall / (precision + recall)
+    if bpm <= 0:
+        return 0.0
+    import librosa  # noqa: PLC0415
+
+    try:
+        _tempo, frames = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=hop, start_bpm=bpm, bpm=bpm, trim=False
+        )
+        times = np.atleast_1d(
+            librosa.frames_to_time(frames, sr=sr, hop_length=hop)
+        )
+        period, _phase, _resid = _fit_period(times)
+        if not np.isfinite(period) or period <= 0.01:
+            period = 60.0 / bpm
+        duration = y.size / float(sr)
+        _grid, hit, _p = _uniform_grid(onset_env, hop, sr, period, duration)
+        return float(hit)
+    except Exception:
+        return 0.0
 
 
-def _adjudicate_bpm(
+def _energy_judge(
     env: np.ndarray,
     hop: int,
     sr: int,
     candidates: list[float],
     base_bpm: float,
 ) -> tuple[float, float, str]:
-    """用音频本身给 BPM 候选当裁判，专治半速 / 倍速误判。
+    """能量终审：每个候选铺网格、搜相位，比综合分。
 
-    librosa 的自相关只能给出「T、2T、4T 都有峰」的一堆候选，最后由一个以 120
-    为中心的先验挑一个 —— 挑错就是整体差一倍（实测《漂移》真值 184.6 被读成
-    92.3，合成 175 BPM 被读成 87.6）。这里换成让音频自己说话：把每个候选铺成
-    均匀网格，数它踩中了多少起音、又漏掉多少，取 F1 最高的那个；并且**只在明显
-    更优时才改判**（``config.ADJ_MARGIN``），避免把本来读对的曲子改坏。
+    打分 = ``sum/√点数 × (软底 + 精确率因子)``（参数与理由见 config 注释块）：
 
-    返回 ``(最终 BPM, 得分, 结论)``，``结论`` 取值：
-    ``switch`` 改判 / ``keep`` 原值就是最优 / ``keep-margin`` 优势不够大，维持原值。
+    * ``sum/√点数`` —— 总和与均值的折中。等强拍下真值与半速读法的**均值**相等
+      （都全踩峰，分不出），而总和恰好差 √2 倍，折中分让点数多的真值胜出。
+    * 精确率因子 —— 网格点踩中**离散起音**的比例。专治两类冒牌候选：
+      倍频误读（一半网格点落在起音空档，实测真值 99.4 的歌精确率 0.80、
+      198.8 只有 0.12）和杂乱切分律动（网格与起音对不上）。刻意不用召回率
+      —— 它的分母是全部起音数，「一拍多个起音」的歌里真值召回率被天然压低，
+      旧裁决（F1）就是这么把 99.4 推成 198.8 的。
+
+    相位粗搜步长约 5ms（竞品同款），打分窗口 ±``config.JUDGE_WIN`` 帧取最大，
+    容忍 ±23ms 的对齐误差。挑战者要赢过 base（DP 锚点）``config.JUDGE_MARGIN``
+    倍才改判；**倍频关系**（差 2 倍 / 半速）用更高的 ``config.JUDGE_OCTAVE_MARGIN``。
+    分数持平时候选顺序优先（base 变体排最前，竞品同款）—— 平分说明音频本身
+    分不出，听 DP 锚点的。
+
+    返回 ``(最终 BPM, 得分, 结论)``，``结论``：``switch`` / ``keep`` / ``keep-margin``。
     """
-    onsets = _onset_times(env, hop, sr)
-    if onsets.size < 4 or not candidates:
+    n = env.size
+    valid = [c for c in candidates if c > 0 and np.isfinite(c)]
+    if n < 8 or not valid:
         return base_bpm, 0.0, "keep"
 
-    span = float(onsets[-1]) + 1e-6
+    frame_dt = hop / float(sr)
+    dur = n * frame_dt
+    onsets = _onset_times(env, hop, sr)
 
-    def best_fit(bpm: float) -> float:
+    def profile(bpm: float) -> float:
         period = 60.0 / bpm
-        tol = min(period * config.ADJ_TOL_RATIO, config.ADJ_TOL_SEC)
+        steps = max(8, min(120, int(period / 0.005)))
+        tol = min(period * config.JUDGE_PREC_TOL_RATIO, config.JUDGE_PREC_TOL_SEC)
         best = 0.0
-        # 相位要一起搜：网格整体错开半拍会让所有候选都掉分，分数就失去可比性
-        for step in range(max(1, int(config.ADJ_PHASES))):
-            grid = np.arange(period * step / float(config.ADJ_PHASES), span, period)
-            f1 = _grid_fit(grid, onsets, tol)[2]
-            if f1 > best:
-                best = f1
+        for s in range(steps):
+            phase = period * s / float(steps)
+            idx = np.rint(np.arange(phase, dur, period) / frame_dt).astype(np.int64)
+            idx = idx[(idx >= 0) & (idx < n)]
+            if idx.size == 0:
+                continue
+            vals = env[idx].astype(np.float64)
+            for off in range(1, config.JUDGE_WIN + 1):
+                vals = np.maximum(vals, env[np.clip(idx + off, 0, n - 1)])
+                vals = np.maximum(vals, env[np.clip(idx - off, 0, n - 1)])
+            sc = float(vals.sum()) / np.sqrt(idx.size)
+            prec = _match_rate(idx * frame_dt, onsets, tol)
+            combined = sc * (
+                config.JUDGE_PREC_FLOOR
+                + (1.0 - config.JUDGE_PREC_FLOOR) * prec
+            )
+            best = max(best, combined)
         return best
 
-    scored: list[tuple[float, float]] = []
-    for bpm in candidates:
-        if bpm <= 0 or not np.isfinite(bpm):
-            continue
-        scored.append((float(bpm), best_fit(float(bpm))))
+    scored = {b: profile(float(b)) for b in valid}
+    best_bpm, best_score = max(scored.items(), key=lambda kv: kv[1])
+    base_key = next((b for b in scored if abs(b - base_bpm) <= 0.15), None)
+    base_score = scored[base_key] if base_key is not None else 0.0
 
-    if not scored:
-        return base_bpm, 0.0, "keep"
-
-    best_bpm, best_score = max(scored, key=lambda kv: kv[1])
-    base_score = next(
-        (s for b, s in scored if abs(b - base_bpm) <= 0.15), 0.0
-    )
-
+    if base_score <= 0 or best_score <= 0 or base_key is None:
+        return base_bpm, base_score, "keep"
     if abs(best_bpm - base_bpm) <= 0.15:
         return base_bpm, base_score, "keep"
-    if best_score <= base_score * config.ADJ_MARGIN:
+
+    # 倍频关系（差 2 倍 / 半速）用更高的门槛 —— 那正是「99.4 被推成 198.8」
+    # 的形态，半拍弱律动会凑出 1.1 倍左右的优势。
+    ratio = max(best_bpm, base_bpm) / min(best_bpm, base_bpm)
+    is_octave = 1.9 <= ratio <= 2.1 or 0.475 <= ratio <= 0.525
+    margin = config.JUDGE_OCTAVE_MARGIN if is_octave else config.JUDGE_MARGIN
+    if best_score <= base_score * margin:
         return base_bpm, base_score, "keep-margin"
     return best_bpm, best_score, "switch"
 
@@ -432,12 +676,15 @@ def analyze(
     检测前会掐掉首尾静音，所以必须把掐掉的偏移补回去 —— 否则拍点画到原始波形上
     会整体错位，看着像「轻微没对齐」，比明显错位更容易误导人。
 
-    自动检测这条路会多走两道工序（详见 ``_adjudicate_bpm`` / ``_fit_period``）：
-    先用音频给半速 / 倍速候选裁决一次，再用拍点序列拟合出精确周期、铺一条
-    **严格等间隔**的均匀网格。``bpm_raw`` / ``adjudicated`` 记录裁决前后的差别。
+    自动检测走「DP 锚点 → 多频带投票 → 能量终审 → 周期拟合 → 均匀网格」五步
+    （详见 ``_vote_candidates`` / ``_energy_judge`` / ``_fit_period``）：
+    librosa 的 DP 拍点当终审 base（锚点），14 个频带各测各的 BPM 折叠投票
+    生成候选池，候选再各铺网格比「能量总和 ÷ √点数」定终审，最后用终审 BPM
+    引导出的 DP 拍点拟合出精确周期、铺一条**严格等间隔**的网格。
+    ``bpm_raw`` 是 DP 原始值，``adjudicated`` 记录终审是否改判。
 
     ``forced_bpm`` 用来按用户指定的 BPM 重新生成拍点（候选值切换 / 手动修正）。
-    给了它就跳过裁决 —— 用户可能正是在纠正检测，不该被算法改回去；网格照铺。
+    给了它就跳过投票与终审 —— 用户可能正是在纠正检测，不该被算法改回去；网格照铺。
     """
     import librosa  # 首次导入较慢，放在函数内延迟加载
 
@@ -457,44 +704,58 @@ def analyze(
 
     # trim=False 是必须的：默认的 trim=True 会拿「平滑拍点包络的一半 RMS」当阈值，
     # 从头逐帧扫到第一个超过阈值的帧，把这段里的拍点全部抹掉。节奏偏轻的前奏
-    # 因此会整段丢拍点（实测一个 0.5 秒静音 + 均匀点击的样本，开头 3 秒被清空）。
-    # 音频级的静音修剪上面已经做过了，这里不需要它再裁一次。
+    # 因此会整段丢拍点。音频级的静音修剪上面已经做过了，这里不需要它再裁一次。
     hop = config.ANALYSIS_HOP
-    tempo, frames = librosa.beat.beat_track(
-        y=y,
-        sr=sr,
-        hop_length=hop,
-        start_bpm=120.0,
-        bpm=forced_bpm,
-        trim=False,
-    )
-    bpm = float(np.atleast_1d(tempo)[0])
-    bpm_raw = bpm
-
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     if onset_env.size:
         clarity = float(onset_env.max() / (onset_env.mean() + 1e-9))
     else:
         clarity = 1.0
 
-    # ---- 用音频给候选当裁判，压掉半速 / 倍速误判。
-    # 用户手动填了 BPM 就直接听他的，不再自作主张改判（他可能就是在纠正检测）。
+    # ---- ① DP 锚点：librosa 的全局时序最优解，作为终审 base。
+    # 用户手动填了 BPM 就直接听他的（他可能就是在纠正检测）。
     verdict = "user" if forced_bpm is not None else "keep"
     adj_score = 0.0
-    if forced_bpm is None:
-        chosen, adj_score, verdict = _adjudicate_bpm(
-            onset_env, hop, sr, _bpm_candidates(bpm), bpm
+    vote_top2 = 0.0
+    tempo, frames = librosa.beat.beat_track(
+        y=y, sr=sr, hop_length=hop, start_bpm=120.0, trim=False
+    )
+    bpm_raw = float(np.atleast_1d(tempo)[0])
+
+    if forced_bpm is not None:
+        chosen = float(forced_bpm)
+    else:
+        dp_fold = _fold_bpm(bpm_raw)
+        pool, _vote_top1, vote_top2 = _vote_candidates(y, sr, hop, dp_fold)
+        # 终审 env 用全频段谱通量（onset_env）：实测它在「半拍有弱律动」的歌上
+        # 区分度极好 —— 弱律动被 onset 检测的局部均值归一压低，拍点贴合度的差距
+        # 拉得很开（实测一首歌 606ms 网格 3.77x vs 302ms 只有 1.1x）。多带
+        # 正差分反而会把半拍切分律动算进来（实测半拍能量达拍点的 82%），让
+        # 快侧候选白占便宜。
+        chosen, adj_score, verdict = _energy_judge(
+            onset_env, hop, sr, pool, dp_fold
         )
-        if verdict == "switch":
-            tempo, frames = librosa.beat.beat_track(
-                y=y,
-                sr=sr,
-                hop_length=hop,
-                start_bpm=120.0,
-                bpm=chosen,
-                trim=False,
-            )
-            bpm = float(np.atleast_1d(tempo)[0])
+        # ---- 倍频复核：终审改判且与 base 差 2 倍 / 半速时，用**精细贴合度**
+        # 复核一次（这正是「99.4 被推成 198.8」的形态 —— 能量 sum/√N 会因半拍
+        # 律动偏爱快侧，而贴合度是独立的证据：实测一首歌 99.4 侧 3.85x、
+        # 198.8 侧 2.95x）。base 的贴合度显著更高 → 否决改判；贴合度接近
+        # （等强拍的两种读法物理等价）→ 放行能量结论 —— 那时快侧对跑步更实用。
+        if verdict == "switch" and _is_octave(chosen, dp_fold):
+            q_best = _grid_quality(y, onset_env, hop, sr, chosen)
+            q_base = _grid_quality(y, onset_env, hop, sr, dp_fold)
+            if q_base > q_best * config.JUDGE_OCTAVE_MARGIN:
+                chosen, verdict = dp_fold, "keep-margin"
+
+    # ---- ② 拍点：终审定下 BPM 后，让 beat_track 拿着它去找 DP 拍点序列
+    #（bpm= 参数给定时 librosa 跳过 tempo 估计，拍点直接按这个速度跟踪）。
+    if chosen > 0 and abs(chosen - bpm_raw) > 0.15:
+        tempo, frames = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=hop,
+            start_bpm=chosen, bpm=chosen, trim=False,
+        )
+    bpm = bpm_raw if abs(bpm_raw - chosen) <= 0.15 else chosen
+    if bpm <= 0:
+        bpm = 120.0
 
     times = librosa.frames_to_time(frames, sr=sr, hop_length=hop)
     raw_times = [round(float(t) + offset, 3) for t in np.atleast_1d(times)]
@@ -549,6 +810,7 @@ def analyze(
         "grid_hit": round(grid_hit, 2),
         "grid_fit_resid": round(fit_resid, 4),
         "adjudicate_score": round(adj_score, 4),
+        "vote_top2": round(vote_top2, 1),
         "trim_offset": round(offset, 3),
         "peaks": _peaks_from(y_raw, buckets),
     }
@@ -571,6 +833,7 @@ def warmup() -> None:
     y[:: int(config.ANALYSIS_SR * 0.5)] = 0.9      # 每 0.5 秒一个脉冲，凑够 DP 的最小长度
     librosa.effects.trim(y, top_db=40.0)
     librosa.onset.onset_strength(y=y, sr=config.ANALYSIS_SR, hop_length=config.ANALYSIS_HOP)
+    librosa.stft(y, n_fft=config.BAND_N_FFT, hop_length=config.ANALYSIS_HOP)
     librosa.beat.beat_track(
         y=y, sr=config.ANALYSIS_SR, hop_length=config.ANALYSIS_HOP, trim=False
     )
