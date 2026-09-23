@@ -38,6 +38,38 @@ def make_click_track(path: Path, bpm: float, seconds: float = 24.0) -> Path:
     return path
 
 
+def make_weak_strong_track(path: Path, bpm: float, seconds: float = 20.0) -> Path:
+    """强弱交替陷阱：每拍一个强击（1200Hz），半拍处一个弱击（600Hz）。
+
+    自相关在 T(=bpm) 和 T/2(=2bpm) 都有峰，是半速/倍速误判的经典陷阱
+    （昨天真歌 99.4 被误判成 198.8 的结构）。
+    弱击用不同频段（600Hz），模拟真实音乐里军鼓/底鼓的频谱差异 ——
+    同频弱击的合成信号会让 onset 峰等高，属于人造失真，不作为用例。
+    """
+    sr = 44100
+    t = np.arange(int(sr * seconds)) / sr
+    period = 60.0 / bpm
+    sig = np.zeros_like(t)
+    beat_idx = np.arange(int(seconds * bpm / 60.0) + 1)
+    n = int(0.12 * sr)
+    tt = np.arange(n) / sr
+    for k in beat_idx:
+        t0 = k * period
+        i0 = int(t0 * sr)
+        if i0 + n >= t.size:
+            break
+        # 强击：高频 1200Hz
+        sig[i0:i0 + n] += 0.9 * np.sin(2 * np.pi * 1200.0 * tt) * np.exp(-55 * tt)
+        # 半拍弱击：低频 600Hz，幅度 0.55 倍
+        i1 = int((t0 + period / 2) * sr)
+        if i1 + n < t.size:
+            sig[i1:i1 + n] += 0.55 * 0.9 * np.sin(2 * np.pi * 600.0 * tt) * np.exp(-55 * tt)
+    sig = sig / (np.max(np.abs(sig)) + 1e-9) * 0.9
+    stereo = np.stack([sig, sig], axis=1)
+    sf.write(str(path), stereo, sr, subtype="PCM_16")
+    return path
+
+
 def section(title: str) -> None:
     print()
     print("=" * 62)
@@ -104,6 +136,27 @@ def main() -> int:
             failures.append(
                 f"BPM 裁决没能修正半速误判：真值 {truth}，检测 {got['bpm_raw']}，"
                 f"裁决后 {got['bpm']}"
+            )
+
+    # 强弱交替陷阱：半拍弱击让 T 和 T/2 都有自相关峰。
+    # 目标：最终值回到真值附近，不许被能量终审改判成 2 倍速
+    # （99.4 是昨天真实歌曲误判成 198.8 的回归闸）。
+    weak_cases = [99.4, 120.0, 150.0]
+    for truth in weak_cases:
+        sample = workdir / f"weak_{truth}.wav"
+        make_weak_strong_track(sample, truth, 20.0)
+        ana = audio.to_analysis_wav(sample, workdir / f"weak_ana_{truth}.wav")
+        got = audio.analyze(ana, buckets=0)
+        err = abs(got["bpm"] - truth)
+        ok = err <= 3.0
+        print(
+            f"  [{'OK ' if ok else 'BAD'}] 强弱交替 真值 {truth:>5.1f} | 检测 {got['bpm_raw']:>5.1f} "
+            f"-> 裁决 {got['bpm']:>5.1f} ({got['adjudicated']:<12}) 误差 {err:.1f}"
+        )
+        if not ok:
+            failures.append(
+                f"强弱交替样本被误判：真值 {truth}，检测 {got['bpm_raw']}，"
+                f"裁决后 {got['bpm']}（{got['adjudicated']}）"
             )
 
     section("5. 均匀网格（周期拟合 + 相位搜索）")
