@@ -11,15 +11,33 @@
 
   <header class="top">
     <h1>Run<span>Beat</span></h1>
-    <p>上传一首歌，改成你的目标步频 —— 速度跟着脚步走，音高不变。</p>
+    <p>上传一批歌，改成你的目标步频 —— 速度跟着脚步走，音高不变。</p>
   </header>
 
   <!-- ============================== 上传 -->
   <div class="dropzone" id="dropzone">
     <div class="big">把音频文件拖到这里</div>
-    <div class="sub">或点击选择 · mp3 / wav / m4a / flac · 最大 20 MB、10 分钟</div>
+    <div class="sub">可以一次选多个 · mp3 / wav / m4a / flac · 每个最大 20 MB、10 分钟</div>
   </div>
-  <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" hidden>
+  <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" multiple hidden>
+
+  <!-- ============================== 文件列表
+       批量模式下的「总览」：一眼看全每首歌的检测结果和倍率，勾选决定谁进导出。
+       点某一行就把它装进下面的编辑器（换歌逻辑见 app.js 的 switchTo）。 -->
+  <section class="card" id="listCard" hidden>
+    <h2><span class="idx">0</span>文件列表
+      <span class="list-sum" id="listSum">—</span>
+    </h2>
+    <div class="hint" style="margin-top:0">
+      勾选要导出的，点一行进入编辑。每首歌的步频、裁剪区间、节拍声都各自独立，
+      互不影响。
+    </div>
+    <div class="file-list" id="fileList"></div>
+    <div class="list-foot">
+      <button class="btn ghost" id="applyAllBtn" type="button">把当前这首的设置应用到全部</button>
+      <button class="btn ghost" id="clearListBtn" type="button">清空列表</button>
+    </div>
+  </section>
 
   <div id="panel" hidden>
 
@@ -34,7 +52,7 @@
           <div class="name" id="trackName">—</div>
           <div class="meta" id="trackMeta">—</div>
         </div>
-        <button class="btn ghost" id="changeFileBtn" type="button">换一首</button>
+        <button class="btn ghost" id="changeFileBtn" type="button">添加更多</button>
       </div>
 
       <!-- 检测结果：主数字 + 可信度 -->
@@ -234,12 +252,42 @@
 
   </div>
 
-  <!-- ============================ 6 缓存与数据
+  <!-- ============================ 6 批量导出
+       只对「勾选的文件」生效：先逐首生成（后端完整渲染），再一起下载。
+       放在 #panel 外面，因为它是「对整批操作」，不属于任何单独一首。 -->
+  <section class="card" id="batchCard" hidden>
+    <h2><span class="idx">6</span>批量导出
+      <span class="batch-sum" id="batchSum">—</span>
+    </h2>
+    <div class="hint" style="margin-top:0">
+      把上面勾选的歌全部生成一遍，再一起下载。生成用的是服务端完整渲染，
+      音质和自己单独导出时一样。
+    </div>
+
+    <div class="export-row">
+      <button class="btn primary" id="batchExportBtn" type="button">
+        <span class="btn-label">生成选中的文件</span>
+      </button>
+      <label class="checkline" style="margin:0">
+        <input type="checkbox" id="batchZip" checked>
+        打包成一个 zip 一起下载
+      </label>
+    </div>
+
+    <div class="batch-progress" id="batchProgress" hidden>
+      <div class="bp-bar"><div class="bp-fill" id="bpFill"></div></div>
+      <div class="bp-text" id="bpText">—</div>
+    </div>
+
+    <div id="batchResult"></div>
+  </section>
+
+  <!-- ============================ 7 缓存与数据
        注意：这一节必须在 #panel **外面**。它管的是磁盘上的临时文件，
        跟「有没有加载歌曲」无关 —— 放进 #panel 里的话，没上传歌的时候
        整个面板都看不见，而那恰恰是最需要清缓存的时候。 -->
   <section class="card">
-    <h2><span class="idx">6</span>缓存与数据
+    <h2><span class="idx">7</span>缓存与数据
       <span class="cache-total" id="cacheTotal">—</span>
     </h2>
     <div class="hint" style="margin-top:0">

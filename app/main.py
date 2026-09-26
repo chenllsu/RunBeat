@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -50,7 +53,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="RunBeat", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="RunBeat", version="0.3.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------
@@ -85,6 +88,18 @@ class MetronomeRequest(BaseModel):
 class ClearRequest(BaseModel):
     # 类别清单由 store.CLEARABLE 定义，这里不写死具体值 —— 否则加一类要改两处。
     kinds: list[str] = Field(..., min_length=1, description="要清理的类别")
+
+
+class PackageItem(BaseModel):
+    """要打进 zip 的一个成品。"""
+
+    name: str = Field(..., description="OUTPUT_DIR 里的实际文件名")
+    as_name: str | None = Field(None, description="在 zip 里显示的名字，缺省用它自己")
+
+
+class PackageRequest(BaseModel):
+    items: list[PackageItem] = Field(..., min_length=1, description="要打包的成品")
+    zip_name: str | None = Field(None, description="zip 文件名（不含扩展名），缺省自动生成")
 
 
 # --------------------------------------------------------------------------
@@ -164,9 +179,7 @@ def _beats_for(record: dict, bpm: float) -> dict:
     if entry is None:
         analysis = Path(record["analysis_path"])
         if not analysis.is_file():
-            # 分析文件被「清缓存」删掉了（那是唯一用到它的地方）—— 从原文件重建，
-            # 而不是直接抛错。不重建的话，用户换一个候选 BPM 就会撞上 500
-            # 「拍点计算失败」，看着像功能坏了，其实只是少了个随时能重算的中间文件。
+            # 分析 wav 被「清缓存」删掉时从原文件重建，别让用户撞 500
             audio.to_analysis_wav(Path(record["source_path"]), analysis)
         info = audio.analyze(analysis, buckets=0, forced_bpm=bpm)
         entry = {
@@ -215,9 +228,8 @@ async def storage() -> dict:
 async def cache_clear(req: ClearRequest) -> dict:
     """按类别删除运行时文件。
 
-    删除**不可恢复**，所以界面那边必须走完二次确认才调到这里。这里是最后
-    一道闸：只认 ``store.CLEARABLE`` 里登记过的类别，别的字符串一律 400 ——
-    不能让接口变成一个「传个路径就删」的口子。
+    不可恢复操作的最后一道闸：只认 ``store.CLEARABLE`` 里登记过的类别，
+    别的一律 400 —— 不能让接口变成「传个路径就删」的口子。
     """
     unknown = [k for k in req.kinds if k not in store.CLEARABLE_KINDS]
     if unknown:
@@ -226,8 +238,12 @@ async def cache_clear(req: ClearRequest) -> dict:
     return await run_in_threadpool(store.clear, req.kinds)
 
 
-@app.post("/api/upload")
-async def upload(file: UploadFile = File(...)) -> dict:
+async def _ingest_one(file: UploadFile) -> dict:
+    """单个上传文件走完整条链路：落盘 → 探测 → 转分析 wav → 检测节拍。
+
+    失败一律抛 ``HTTPException``，由调用方决定是「整体失败」还是「记进批量
+    结果、继续下一个」。返回结构与单文件 /api/upload 完全一致。
+    """
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in config.ALLOWED_SUFFIXES:
         allowed = " / ".join(sorted(s.lstrip(".") for s in config.ALLOWED_SUFFIXES))
@@ -337,10 +353,8 @@ async def upload(file: UploadFile = File(...)) -> dict:
         "clarity": detected["clarity"],
         "beat_count": detected["beat_count"],
         "interval_cv": detected["interval_cv"],
-        # 均匀网格的两个诊断值。grid_hit = 网格点处的平均起音强度 ÷ 全曲平均，
-        # 1.0 左右等于随机落点、3 以上算踩得准；grid_fit_resid 是拍点相对拟合
-        # 直线的残差，偏大说明这首曲子在飘（现场版 / 渐快），均匀网格对这类
-        # 曲子的贴合度天然会低一些 —— 但节拍稳仍然是用户要的。
+        # grid_hit = 网格点平均起音强度 ÷ 全曲平均（1.0≈随机落点，3+≈踩得准）；
+        # grid_fit_resid = 拍点拟合残差，偏大说明曲子在飘
         "grid_hit": detected["grid_hit"],
         "grid_fit_resid": detected["grid_fit_resid"],
         "source_url": f"/media/source/{source_path.name}",
@@ -354,6 +368,48 @@ async def upload(file: UploadFile = File(...)) -> dict:
             "wave_window": config.WAVE_WINDOW_SEC,
             "metronome_length": config.METRONOME_LENGTH_SEC,
         },
+    }
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)) -> dict:
+    """上传单个文件。响应与以往完全一致 —— 内部走的就是批量用的同一条链路。"""
+    return await _ingest_one(file)
+
+
+@app.post("/api/upload-many")
+async def upload_many(files: list[UploadFile] = File(...)) -> dict:
+    """一次上传多个文件，逐个独立处理，失败隔离（单个不合格不连累整批）。
+
+    串行处理：每首预热后只要几百毫秒到几秒，串行让进度条有意义，
+    也避免 N 个解码任务抢爆磁盘和 CPU。
+    """
+    if not files:
+        raise HTTPException(400, "没有收到文件")
+    if len(files) > config.MAX_BATCH_FILES:
+        raise HTTPException(
+            400,
+            f"一次最多处理 {config.MAX_BATCH_FILES} 个文件，这次给了 {len(files)} 个",
+        )
+
+    items: list[dict] = []
+    for handle in files:
+        name = handle.filename or "未知文件"
+        try:
+            data = await _ingest_one(handle)
+            items.append({"ok": True, "name": data["name"], "data": data})
+        except HTTPException as exc:
+            await handle.close()
+            items.append({"ok": False, "name": name, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 —— 兜底，别让单个文件炸掉整批
+            await handle.close()
+            items.append({"ok": False, "name": name, "error": f"处理失败：{exc}"})
+
+    ok_count = sum(1 for item in items if item["ok"])
+    return {
+        "items": items,
+        "ok_count": ok_count,
+        "fail_count": len(items) - ok_count,
     }
 
 
@@ -519,8 +575,7 @@ async def export(req: StretchRequest) -> dict:
         )
 
     _codec_args, ext = audio.output_settings()
-    # 文件名要带上节拍声和区间这两维，否则同一个 file_id + 同一个倍率下，
-    # 「带节拍声 / 不带」「整首 / 某个片段」会互相覆盖对方。
+    # 文件名带上节拍声与区间两维，否则「带/不带 click」「整首/片段」互相覆盖
     tag = f"_m{int(round(req.metronome_gain * 100)):03d}" if want_click else ""
     clip_tag = f"_c{_mmss(start)}-{_mmss(start + length)}" if clipped else ""
     target = config.OUTPUT_DIR / f"{req.file_id}_{int(plan.ratio * 1000):04d}{tag}{clip_tag}{ext}"
@@ -532,8 +587,7 @@ async def export(req: StretchRequest) -> dict:
             source,
             target,
             plan.ratio,
-            # 不裁剪时仍走「整首」那条老分支（它会多留一点尾巴，保证最后一声
-            # click 不被切掉），只在真要裁剪时才把区间传下去。
+            # 不裁剪时仍走「整首」分支（多留尾巴保证最后一声 click 不被切掉）
             start if clipped else None,
             length if clipped else None,
             beats,
@@ -575,16 +629,73 @@ async def export(req: StretchRequest) -> dict:
     }
 
 
+def _unique_arcname(shown: str, used: set[str]) -> str:
+    """给 zip 里的条目取不重名的名字（同一首歌不同参数导出的下载名可能撞车，
+    重名时解压会静默丢文件）。"""
+    stem, ext = os.path.splitext(shown)
+    candidate = shown
+    seq = 1
+    while candidate in used:
+        seq += 1
+        candidate = f"{stem} ({seq}){ext}"
+    used.add(candidate)
+    return candidate
+
+
+@app.post("/api/package")
+async def package(req: PackageRequest) -> dict:
+    """把多个已生成的成品打成一个 zip，供一次下载。
+
+    刻意用 ``ZIP_STORED``（不压缩）：里面的 mp3 / m4a 本身就是压缩格式，
+    deflate 几乎压不动，却要为几 MB 的文件白烧几秒 CPU。
+    """
+    picked: list[tuple[Path, str]] = []
+    for item in req.items:
+        path = config.OUTPUT_DIR / _safe_output_name(item.name)
+        if path.is_file():
+            picked.append((path, item.as_name or path.name))
+    if not picked:
+        raise HTTPException(404, "没有可打包的成品，请先点「生成」")
+
+    used: set[str] = set()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = config.OUTPUT_DIR / f"runbeat_{len(picked)}songs_{stamp}.zip"
+
+    # 先写临时文件再原子改名：中途失败不留半截 zip
+    fd, tmp_name = tempfile.mkstemp(suffix=".zip", dir=str(config.TMP_DIR))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as archive:
+            for path, shown in picked:
+                archive.write(path, arcname=_unique_arcname(shown, used))
+        tmp_path.replace(target)
+    except Exception as exc:
+        store.safe_unlink(tmp_path)
+        raise HTTPException(500, f"打包失败：{exc}") from exc
+
+    stem = (req.zip_name or f"runbeat_{len(picked)}首").strip() or "runbeat"
+    return {
+        "url": f"/media/output/{target.name}",
+        "download_url": f"/api/download/{target.name}?as_name={quote(stem + '.zip')}",
+        "filename": f"{stem}.zip",
+        "count": len(picked),
+        "bytes": target.stat().st_size,
+    }
+
+
 @app.get("/api/download/{name}")
 async def download(name: str, as_name: str | None = None):
     path = config.OUTPUT_DIR / _safe_output_name(name)
     if not path.is_file():
         raise HTTPException(404, "文件不存在或已被清理，请重新生成")
-    return FileResponse(
-        path,
-        media_type="audio/mpeg" if path.suffix == ".mp3" else "audio/mp4",
-        filename=as_name or path.name,
-    )
+    # zip 也走这里（批量打包下载），media_type 按后缀给而不是写死音频类型
+    media_type = {
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".zip": "application/zip",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media_type, filename=as_name or path.name)
 
 
 # --------------------------------------------------------------------------

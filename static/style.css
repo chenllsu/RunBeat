@@ -944,3 +944,122 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   .cache-foot-btns, .modal-btns { justify-content: flex-end; }
 }
 
+/* ============================================================ 文件列表（批量）
+ *
+ * 列表是「总览 + 选择器」：一行一首歌，勾选决定谁进导出，点行切换编辑对象。
+ * 整行都是热区（用委托点击），不要求用户瞄准文件名去点。 */
+
+.list-sum,
+.batch-sum {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-list {
+  margin-top: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  border-top: 1px solid var(--line-soft);
+}
+.file-row:first-child { border-top: none; }
+.file-row:hover { background: var(--panel-2); }
+
+/* 用 inset 阴影而不是 border-left：不占布局宽度，行内元素不会因此错位 */
+.file-row.on {
+  background: var(--panel-2);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.file-row input[type="checkbox"] {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.fr-main { min-width: 0; flex: 1; }
+
+.fr-name {
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fr-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.fr-bpm {
+  flex: none;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.fr-bpm b { font-size: 13px; font-weight: 500; }
+.fr-bpm span { display: block; font-size: 12px; color: var(--dim); }
+
+.fr-state {
+  flex: none;
+  width: 58px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--dim);
+}
+.fr-state.ok { color: var(--accent); }
+.fr-state.bad { color: var(--danger); }
+.fr-state.wait { color: var(--warn); }
+
+.list-foot {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+/* ============================================================ 批量导出 */
+
+.batch-progress { margin-top: 14px; }
+
+.bp-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.bp-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width .2s ease;
+}
+
+.bp-text {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 560px) {
+  .fr-state { width: 46px; }
+  .fr-bpm { min-width: 62px; }
+}
+

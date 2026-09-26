@@ -1,11 +1,7 @@
 """音频处理核心：定位 ffmpeg、探测时长、检测 BPM、时间伸缩（变速不变调）。
 
-设计要点
---------
-* 预览与正式生成走的是**同一个** :func:`render` 函数，差别只在 ``start`` /
-  ``length`` 两个参数（预览=截一段，导出=整首）。
-* 「变速不变调」由 ffmpeg 的 ``atempo`` 滤镜实现 —— 改速度，音高不动。
-* ``atempo`` 单级只支持 0.5~2.0 倍，超出范围时自动拆成多级串联。
+* 预览与正式生成走**同一个** :func:`render`，差别只在 ``start`` / ``length``。
+* 变速不变调用 ffmpeg ``atempo`` 实现，单级 0.5~2.0，超出自动拆多级串联。
 * mp3 编码器不一定存在，启动时探测一次，没有就退回 aac/m4a。
 """
 
@@ -173,8 +169,7 @@ def _bpm_candidates(bpm: float) -> list[float]:
 def _fold_bpm(bpm: float) -> float:
     """把候选 BPM 折叠到 :data:`config.FOLD_CENTER` 附近（2^k 倍里取最近的）。
 
-    自相关对 T、2T、4T 都会有峰，直接拿峰对应的 BPM 投票，半速 / 倍速会各拉一票。
-    折叠之后它们落回同一个值，票数才能聚到一起。范围 20~400，跟竞品一致。
+    自相关对 T、2T、4T 都有峰，不折叠的话半速/倍速会各拉一票，票数聚不到一起。
     """
     if bpm <= 0 or not np.isfinite(bpm):
         return 0.0
@@ -203,11 +198,8 @@ def _fold_bpm(bpm: float) -> float:
 def _cluster_vote(items: list[tuple[float, float]]) -> list[list[float]]:
     """聚类投票。``items`` 是 ``(BPM, 权重)``，返回 ``[代表BPM, 权重和]`` 按权重降序。
 
-    权重只决定簇的代表（先进簇的是权重最高的）；票值按竞品做法聚类（相差
-    ``config.VOTE_TOL`` 以内合并），但**累加的是权重而不是个数** —— 峰的强弱
-    本身就是证据，纯计票会把「一个强峰 + 一个弱峰」和「两个噪声峰」当成
-    同样的两票，实测 150 BPM 样本的真值峰（权重 1600+）就是这样被
-    伪峰（权重 680）以票数挤掉的。平票时代表与 120 更近的排前面。
+    相差 ``config.VOTE_TOL`` 以内合并成簇，但**累加的是权重不是个数** ——
+    峰的强弱本身就是证据，纯计票会让真值强峰被两个噪声峰挤掉。
     """
     clusters: list[list[float]] = []
     for bpm, w in sorted(items, key=lambda t: -t[1]):
@@ -227,9 +219,8 @@ def _cluster_vote(items: list[tuple[float, float]]) -> list[list[float]]:
 def _autocorr_pearson(x: np.ndarray) -> np.ndarray:
     """归一化自相关（Pearson 修正），FFT 实现。
 
-    竞品的写法是分母除以 ``sqrt(var_前段 × var_后段) × (N-lag)``，等价于把每个
-    lag 的重合段当成两条独立序列算相关系数 —— 修掉了「短 lag 重合样本少、
-    乘积天然偏大」的统计偏置。这里用累积平方和把 O(N²) 压到 O(N log N)。
+    分母把每个 lag 的重合段当成两条独立序列算相关系数，修掉「短 lag 重合
+    样本少、乘积天然偏大」的统计偏置；累积平方和把 O(N²) 压到 O(N log N)。
     """
     n = x.size
     out = np.zeros(n, dtype=np.float64)
@@ -252,12 +243,11 @@ def _autocorr_pearson(x: np.ndarray) -> np.ndarray:
 
 
 def _band_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
-    """STFT → 14 个频带的帧能量序列，形状 ``(带数, 帧数)``。
+    """STFT → 14 个频带的帧能量序列，形状 ``(带数, 帧数)``，逐带 z-score 归一化。
 
-    **逐带** z-score 归一化（每条序列除以自己的标准差）：让 hi-hat 带和
-    底鼓带一人一票，同时保留帧与帧之间的强弱差 —— 那是「哪边才是真拍」的
-    关键证据。竞品用的是逐帧跨带 L2 归一化，实测会把强弱拍的整体响度差
-    抹平（强弱击频谱相近时），自相关便分不清 T 和 T/2 哪个是拍。
+    逐带归一化让 hi-hat 带和底鼓带一人一票，同时保留帧间强弱差（分清 T 和
+    T/2 哪个是拍的关键证据）。静带过滤必须在 z-score **之前** —— 归一化会把
+    纯数值噪声放大成等权票。
     """
     import librosa  # noqa: PLC0415
 
@@ -276,8 +266,7 @@ def _band_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
         return np.zeros((0, 0), dtype=np.float64)
 
     bands = np.asarray(rows, dtype=np.float64)
-    # 静带过滤：z-score 会把纯数值噪声的 std 放大到 1（和其他带等权），
-    # 必须在归一化**之前**用原始 std 掐掉（阈值见 config.BAND_MIN_STD_RATIO）。
+    # 静带过滤：必须在归一化前用原始 std 掐掉（阈值见 config.BAND_MIN_STD_RATIO）
     raw_std = bands.std(axis=1)
     keep = raw_std > max(float(raw_std.max()), 1e-12) * config.BAND_MIN_STD_RATIO
     bands = bands[keep]
@@ -290,10 +279,8 @@ def _band_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
 def _band_bpm(series: np.ndarray, fps: float) -> list[tuple[float, float]]:
     """单频带检测：自相关 → 峰 → 权重候选，返回 ``(BPM, 权重)`` 列表。
 
-    关键的三道保险（全部照抄竞品）：
-    * lag 限制在 [BPM_LO, BPM_HI] 对应的范围内 —— 搜索空间先收窄；
-    * 峰的权重乘 ``sqrt((N-lag)/N)`` —— 短 lag（高倍速）的重合样本少，天然被压低；
-    * 只取最强的 top 20% 峰 —— 弱峰多数是噪声。
+    三道保险（照抄竞品）：lag 限制在 [BPM_LO, BPM_HI]；峰权重乘
+    ``sqrt((N-lag)/N)`` 压短 lag 高倍速伪峰；只取最强的 top 20% 峰。
     """
     ac = _autocorr_pearson(series)
     n = ac.size
@@ -327,15 +314,12 @@ def _vote_candidates(
 ) -> tuple[list[float], float, float]:
     """多频带投票，返回 ``(终审候选池, 投票top1, top2)``。
 
-    每带内部先折叠投票出前 2 名，再跨带聚类数票。候选池 = DP 值 / 投票
-    top1 / top2 及各自的 2 倍 / 半速，全部框在 [BPM_LO, BPM_HI]。
+    每带折叠投票出前 2 名，再跨带聚类数票；候选池 = DP 值 / 投票 top1 / top2
+    及各自 2 倍/半速变体，框在 [BPM_LO, BPM_HI]。
 
-    ``dp_bpm`` 是 librosa beat_track 的结果（调用前先折叠）。它**不参与投票
-    计权** —— 实测一首 99.4 BPM 的歌，低频带（底鼓+贝斯）会齐刷刷投 132.5
-    （切分律动，权重近 5 万，是 99.4 的两倍），票选 top1 被带跑；但 DP 的全局
-    时序连贯性直接命中 99.4。所以分工是：**DP 当终审 base（锚点），投票负责
-    候选池** —— DP 犯半速错时（175 被读成 87.6），候选池里的 2 倍变体由
-    终审切回，两道证据互补。
+    ``dp_bpm``（调用前先折叠）**不参与投票计权**：低频带会被切分律动带跑，
+    但 DP 的全局时序连贯性更可靠。分工：**DP 当终审 base（锚点），投票负责
+    候选池** —— DP 犯半速错时，候选池里的 2 倍变体由终审切回，两道证据互补。
     """
     bands = _band_energy(y, sr, hop)
     fps = sr / float(hop)
@@ -354,7 +338,7 @@ def _vote_candidates(
     while len(tops) < 2:
         tops.append(0.0)
 
-    # 候选池：DP 变体排最前（base，终审平分时优先），然后投票 top1 / top2 的变体
+    # 候选池：DP 变体排最前（base，终审平分时优先），然后投票 top1/top2 的变体
     pool: list[float] = []
     for base in (dp_bpm, tops[0], tops[1]):
         if base <= 0:
@@ -412,13 +396,12 @@ def _grid_quality(
     sr: int,
     bpm: float,
 ) -> float:
-    """给定 BPM 下的**精细贴合度**（倍频复核用）。
+    """给定 BPM 下的**精细贴合度**（复核终审改判用）。
 
-    用该速度引导 beat_track 找 DP 拍点 → 最小二乘拟合出精确周期 →
-    ``_uniform_grid`` 720 档精细相位搜贴合度。粗打分（``_energy_judge``）
-    的相位只有 5ms 精度、周期未拟合，快侧网格的周期误差会随曲长累积漂移，
-    把贴合度毁掉（实测一首歌 198.8 侧粗评 1.23x、精确周期下其实 2.95x）
-    —— 所以复核必须用拟合周期加精细相位。
+    用该速度引导 beat_track 找 DP 拍点 → 最小二乘拟合精确周期 →
+    ``_uniform_grid`` 720 档精细相位搜贴合度。必须用拟合周期加精细相位：
+    粗打分的相位只有 5ms 精度、周期未量化，快侧网格的周期误差会随曲长
+    累积漂移，把贴合度毁掉。
     """
     if bpm <= 0:
         return 0.0
@@ -450,21 +433,16 @@ def _energy_judge(
 ) -> tuple[float, float, str]:
     """能量终审：每个候选铺网格、搜相位，比综合分。
 
-    打分 = ``sum/√点数 × (软底 + 精确率因子)``（参数与理由见 config 注释块）：
+    打分 = ``sum/√点数 × (软底 + 精确率因子)``（参数见 config 注释）：
 
-    * ``sum/√点数`` —— 总和与均值的折中。等强拍下真值与半速读法的**均值**相等
-      （都全踩峰，分不出），而总和恰好差 √2 倍，折中分让点数多的真值胜出。
-    * 精确率因子 —— 网格点踩中**离散起音**的比例。专治两类冒牌候选：
-      倍频误读（一半网格点落在起音空档，实测真值 99.4 的歌精确率 0.80、
-      198.8 只有 0.12）和杂乱切分律动（网格与起音对不上）。刻意不用召回率
-      —— 它的分母是全部起音数，「一拍多个起音」的歌里真值召回率被天然压低，
-      旧裁决（F1）就是这么把 99.4 推成 198.8 的。
+    * ``sum/√点数`` —— 总和与均值的折中：等强拍下真值与半速读法的均值相等，
+      总和恰好差 √2 倍，折中分让点数多的真值胜出。
+    * 精确率 —— 网格点踩中**离散起音**的比例，专治倍频误读与杂乱切分律动。
+      刻意不用召回率（分母是全部起音数，「一拍多个起音」的歌里真值被天然压低）。
 
-    相位粗搜步长约 5ms（竞品同款），打分窗口 ±``config.JUDGE_WIN`` 帧取最大，
-    容忍 ±23ms 的对齐误差。挑战者要赢过 base（DP 锚点）``config.JUDGE_MARGIN``
-    倍才改判；**倍频关系**（差 2 倍 / 半速）用更高的 ``config.JUDGE_OCTAVE_MARGIN``。
-    分数持平时候选顺序优先（base 变体排最前，竞品同款）—— 平分说明音频本身
-    分不出，听 DP 锚点的。
+    相位粗搜步长约 5ms，打分窗口 ±``config.JUDGE_WIN`` 帧取最大。挑战者要赢过
+    base ``config.JUDGE_MARGIN`` 倍才改判；**倍频关系**用更高的
+    ``config.JUDGE_OCTAVE_MARGIN``。分数持平时候选顺序优先（base 变体排最前）。
 
     返回 ``(最终 BPM, 得分, 结论)``，``结论``：``switch`` / ``keep`` / ``keep-margin``。
     """
@@ -511,8 +489,7 @@ def _energy_judge(
     if abs(best_bpm - base_bpm) <= 0.15:
         return base_bpm, base_score, "keep"
 
-    # 倍频关系（差 2 倍 / 半速）用更高的门槛 —— 那正是「99.4 被推成 198.8」
-    # 的形态，半拍弱律动会凑出 1.1 倍左右的优势。
+    # 倍频关系（差 2 倍/半速）用更高的门槛 —— 半拍弱律动会凑出 ~1.1 倍的假优势
     ratio = max(best_bpm, base_bpm) / min(best_bpm, base_bpm)
     is_octave = 1.9 <= ratio <= 2.1 or 0.475 <= ratio <= 0.525
     margin = config.JUDGE_OCTAVE_MARGIN if is_octave else config.JUDGE_MARGIN
@@ -526,17 +503,11 @@ def _fit_period(
 ) -> tuple[float, float, float]:
     """用拍点序列拟合出**精确的节拍周期**，返回 ``(周期, 首拍截距, 残差标准差)``。
 
-    为什么不能直接用 ``beat_track`` 返回的 tempo：那个值是被量化过的，只能落在
-    ``60 * sr / (hop * L)`` 这张网格上。实测《漂移》真值 322.589 ms，它给出
-    325.027 ms（差 0.76%）—— 拿它铺一条 4 分钟的均匀网格，到曲末已经漂了
-    1.8 秒，网格后半段和鼓点完全错开（贴合度 3.77x → 1.06x，等于随机落点）。
+    不能直接用 ``beat_track`` 的 tempo：那个值被量化在 ``60*sr/(hop*L)`` 网格上
+    （实测偏差 ~0.8%），铺长曲网格到曲末会漂移到和鼓点完全错开。最小二乘拟合
+    （迭代剔除残差大的点，防漏拍/跳拍带偏斜率）能跳出量化网格，精度高一个数量级。
 
-    拍点序列自己就带着「整首歌一共走了多长时间」这个信息，最小二乘拟合能跳出
-    量化网格，精度提高一个数量级。中间迭代剔除残差大的点：漏拍 / 跳拍会让它后面
-    所有点的序号错位，不剔掉会把斜率整个带偏。
-
-    ``残差标准差`` 顺便成了「这首曲子的鼓点规不规则」的度量 —— 很小说明速度恒定，
-    均匀网格很合适；偏大说明曲子在飘（现场版 / 渐快渐慢），那是曲子本身的问题。
+    ``残差标准差`` 顺便度量「曲子速度稳不稳」：偏大说明曲子在飘（现场版/渐快渐慢）。
     """
     arr = np.asarray(beats, dtype=np.float64).ravel()
     if arr.size < 4:
@@ -564,16 +535,11 @@ def _uniform_grid(
 ) -> tuple[np.ndarray, float, float]:
     """铺一条**严格等间隔**的拍点网格，返回 ``(网格点, 贴合度, 最佳相位)``。
 
-    网格只有一个自由参数：整体相位 —— 搜 ``config.GRID_PHASES`` 档，取「网格点处
-    起音强度平均最大」的那一档。**间隔永远等于 ``period``，绝不为了贴某个鼓点让步。**
+    唯一自由参数是整体相位（搜 ``config.GRID_PHASES`` 档取贴合度最高的一档）。
+    **间隔永远等于 ``period``，绝不为了贴某个鼓点让步** —— 跟着跑的节拍必须稳，
+    逐点吸附会把间隔拉扯得忽长忽短，比落不准更难受。
 
-    这是和「逐点吸附」最本质的区别。吸附把每个点独立挪到最近的峰上，看起来每个点
-    都更准了，代价是间隔被拉扯得忽长忽短（实测 CV 2.8% → 4.9%、max 380 → 454 ms）。
-    跟着跑的节拍必须稳 —— 忽快忽慢比落不准更难受，所以宁可整体相位差几毫秒，
-    也要保证每一格的间隔完全一致。
-
-    ``贴合度`` = 网格点处的平均起音强度 ÷ 全曲平均起音强度。1.0 左右说明这条网格
-    和鼓点无关（等于随机落点），3 以上说明踩得相当准。
+    ``贴合度`` = 网格点处平均起音强度 ÷ 全曲平均。1.0 左右=随机落点，3 以上=踩得准。
     """
     n = env.size
     if period <= 1e-3 or n < 4 or duration <= period:
@@ -631,12 +597,10 @@ def _peaks_from(y: np.ndarray, buckets: int) -> list[int]:
 def _extend_beat_grid(
     beats: list[float], duration: float, fallback_bpm: float
 ) -> list[float]:
-    """把拍点网格向两端补齐到整首，避免开头 / 结尾出现没有拍点线的空档。
+    """把拍点网格向两端补齐到整首，避免开头/结尾出现没有拍点线的空档。
 
-    beat_track 只在「有起音」的位置给拍点，前奏或尾奏很轻时两头会缺一截，
-    画到波形上看起来就像检测坏了。这里按拍点间隔的中位数向两端外推补齐。
-
-    中间部分的拍点**原样保留** —— 曲子本身速度有漂移的话，该看出来还是要能看出来。
+    beat_track 在前奏/尾奏很轻时两头会缺一截，按拍点间隔中位数外推补齐。
+    **中间部分原样保留** —— 曲子速度有漂移的话，该看出来还是要能看出来。
     """
     if not beats:
         return []
@@ -672,19 +636,15 @@ def analyze(
 ) -> dict:
     """一次解码拿到：BPM、拍点时间、清晰度、拍点规整度，以及（可选的）波形峰值。
 
-    ``beats`` 是**原曲时间轴**上的拍点秒数，并且已经向两端补齐到整首。
-    检测前会掐掉首尾静音，所以必须把掐掉的偏移补回去 —— 否则拍点画到原始波形上
-    会整体错位，看着像「轻微没对齐」，比明显错位更容易误导人。
+    ``beats`` 是**原曲时间轴**上的拍点秒数，已补齐到整首；检测前掐掉的首尾
+    静音偏移必须补回拍点，否则画到原始波形上会整体错位。
 
-    自动检测走「DP 锚点 → 多频带投票 → 能量终审 → 周期拟合 → 均匀网格」五步
-    （详见 ``_vote_candidates`` / ``_energy_judge`` / ``_fit_period``）：
-    librosa 的 DP 拍点当终审 base（锚点），14 个频带各测各的 BPM 折叠投票
-    生成候选池，候选再各铺网格比「能量总和 ÷ √点数」定终审，最后用终审 BPM
-    引导出的 DP 拍点拟合出精确周期、铺一条**严格等间隔**的网格。
+    自动检测流程：DP 锚点 → 多频带投票出候选 → 能量终审 → 周期拟合 → 均匀网格
+    （详见 ``_vote_candidates`` / ``_energy_judge`` / ``_fit_period``）。
     ``bpm_raw`` 是 DP 原始值，``adjudicated`` 记录终审是否改判。
 
-    ``forced_bpm`` 用来按用户指定的 BPM 重新生成拍点（候选值切换 / 手动修正）。
-    给了它就跳过投票与终审 —— 用户可能正是在纠正检测，不该被算法改回去；网格照铺。
+    ``forced_bpm`` 按用户指定 BPM 重新生成拍点：给了就跳过投票与终审 ——
+    用户可能正是在纠正检测，不该被算法改回去；网格照铺。
     """
     import librosa  # 首次导入较慢，放在函数内延迟加载
 
@@ -702,9 +662,7 @@ def analyze(
     else:
         y = y_raw
 
-    # trim=False 是必须的：默认的 trim=True 会拿「平滑拍点包络的一半 RMS」当阈值，
-    # 从头逐帧扫到第一个超过阈值的帧，把这段里的拍点全部抹掉。节奏偏轻的前奏
-    # 因此会整段丢拍点。音频级的静音修剪上面已经做过了，这里不需要它再裁一次。
+    # trim=False 必须：默认会从开头扫到第一个超阈值帧，把节奏偏轻的前奏整段丢拍点
     hop = config.ANALYSIS_HOP
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     if onset_env.size:
@@ -727,23 +685,24 @@ def analyze(
     else:
         dp_fold = _fold_bpm(bpm_raw)
         pool, _vote_top1, vote_top2 = _vote_candidates(y, sr, hop, dp_fold)
-        # 终审 env 用全频段谱通量（onset_env）：实测它在「半拍有弱律动」的歌上
-        # 区分度极好 —— 弱律动被 onset 检测的局部均值归一压低，拍点贴合度的差距
-        # 拉得很开（实测一首歌 606ms 网格 3.77x vs 302ms 只有 1.1x）。多带
-        # 正差分反而会把半拍切分律动算进来（实测半拍能量达拍点的 82%），让
-        # 快侧候选白占便宜。
+        # 终审 env 用全频段谱通量（onset_env）：半拍弱律动被局部均值归一压低，
+        # 快慢两侧区分度拉得开；多带正差分会把半拍切分律动算进来，让快侧白占便宜
         chosen, adj_score, verdict = _energy_judge(
             onset_env, hop, sr, pool, dp_fold
         )
-        # ---- 倍频复核：终审改判且与 base 差 2 倍 / 半速时，用**精细贴合度**
-        # 复核一次（这正是「99.4 被推成 198.8」的形态 —— 能量 sum/√N 会因半拍
-        # 律动偏爱快侧，而贴合度是独立的证据：实测一首歌 99.4 侧 3.85x、
-        # 198.8 侧 2.95x）。base 的贴合度显著更高 → 否决改判；贴合度接近
-        # （等强拍的两种读法物理等价）→ 放行能量结论 —— 那时快侧对跑步更实用。
-        if verdict == "switch" and _is_octave(chosen, dp_fold):
+        # ---- 贴合度复核：终审改判时用精细贴合度（独立证据）复核一次。
+        # 能量 sum/√N 结构性偏爱快网格，非整数倍误判（1.31x/1.34x）一样会碰线，
+        # 所以复核对**所有** switch 生效。base 贴合度显著更高 → 否决；接近
+        # （等强拍两种读法物理等价）→ 放行。门槛见 config（倍频 1.15 / 其余 1.10）。
+        if verdict == "switch":
             q_best = _grid_quality(y, onset_env, hop, sr, chosen)
             q_base = _grid_quality(y, onset_env, hop, sr, dp_fold)
-            if q_base > q_best * config.JUDGE_OCTAVE_MARGIN:
+            q_margin = (
+                config.JUDGE_OCTAVE_MARGIN
+                if _is_octave(chosen, dp_fold)
+                else config.JUDGE_Q_MARGIN
+            )
+            if q_base > q_best * q_margin:
                 chosen, verdict = dp_fold, "keep-margin"
 
     # ---- ② 拍点：终审定下 BPM 后，让 beat_track 拿着它去找 DP 拍点序列
@@ -760,8 +719,7 @@ def analyze(
     times = librosa.frames_to_time(frames, sr=sr, hop_length=hop)
     raw_times = [round(float(t) + offset, 3) for t in np.atleast_1d(times)]
 
-    # ---- 拍点走严格等间隔的均匀网格，周期由 DP 拍点拟合出来（详见 _fit_period）。
-    # 为什么要拟合而不是直接用 beat_track 的 tempo，见 _fit_period 的 docstring。
+    # ---- 拍点走严格等间隔的均匀网格，周期由 DP 拍点拟合出来（详见 _fit_period）
     fit_period, _fit_phase, fit_resid = _fit_period(
         np.asarray(raw_times, dtype=np.float64) - offset
     )
@@ -777,13 +735,11 @@ def analyze(
     if not detected:
         detected = list(raw_times)
 
-    # 「BPM」必须和网格周期自洽 —— 倍率换算是拿它算的，不一致实际步频就会偏。
-    # 注意这里是**拟合值**（《漂移》184.6 → 186.0），比 beat_track 的 tempo 更接近真值。
+    # 「BPM」必须和网格周期自洽（倍率换算拿它算的）—— 用拟合值，更接近真值
     bpm = 60.0 / fit_period
 
-    # 拍点间隔的相对波动，走的是**DP 拍点**。最终网格是严格等间隔的、CV 恒等于 0，
-    # 没有信息量；这个数回答的是另一件事 ——「这首曲子的速度稳不稳」。速度飘忽的
-    # 曲子（现场版 / 古典）本身就不存在唯一 BPM，grid_fit_resid 也一起说明这件事。
+    # 拍点间隔的相对波动走 **DP 拍点**：最终网格严格等间隔、CV 恒为 0 没信息量，
+    # 这个数回答的是「曲子速度稳不稳」（速度飘忽的曲子本就没有唯一 BPM）
     def _cv(values: list[float]) -> float:
         if len(values) < 3:
             return 0.0
@@ -822,10 +778,8 @@ def detect_bpm(wav_path: Path) -> dict:
 
 
 def warmup() -> None:
-    """跑一遍最小规模的节拍检测，把 librosa / numba 的首次编译开销挪到服务启动时。
-
-    实测 3 分钟音频：冷启动 10.4 秒，编译完成后 2.2 秒。不预热的话，
-    第一个上传的人要多等 8 秒。
+    """跑一遍最小规模的节拍检测，把 librosa / numba 的首次编译开销挪到服务启动时
+    （冷启动 ~10 秒 vs 预热后 ~2 秒，不预热的话第一个上传的人要多等 8 秒）。
     """
     import librosa  # noqa: PLC0415
 
@@ -924,8 +878,8 @@ def render_metronome(
 ) -> Path:
     """把 click 轨混到原曲片段上，用于「听节拍对齐」。
 
-    注意这里**不做时间伸缩**：目的是校对「检测出的拍点对不对」，音频和 click
-    一起变速的话对齐关系不会改变，反而失去了验证意义。
+    刻意**不做时间伸缩**：要校对的是「检测出的拍点对不对」，一起变速的话
+    对齐关系不变，就失去验证意义了。
     """
     import soundfile as sf  # 延迟导入，和 librosa 保持一致的做法
 
@@ -939,9 +893,7 @@ def render_metronome(
 
     codec_args, _ext = output_settings()
     try:
-        # 两路统一成同一采样率与声道布局，避免 amix 因格式不一致报错。
-        # 原曲压到 0.82 倍是为了给 click 留头空间 —— 两边直接相加会超过 1.0，
-        # 编码成 mp3 时被削平。末尾再加一道限幅兜底。
+        # 两路统一采样率/声道；原曲压到 0.82 给 click 留头空间（相加会削波），末尾限幅兜底
         fmt = f"aformat=sample_rates={sr}:channel_layouts=stereo"
         _run_checked(
             [
@@ -963,8 +915,7 @@ def render_metronome(
             ]
         )
     finally:
-        # 中转的 click 轨只是顺手打扫，删不掉也不该让整次请求失败
-        # （受管环境里的受控删除失败时会抛 SystemExit，会直接穿透成 500）。
+        # 中转 click 轨只是顺手打扫；受管删除失败会抛 SystemExit 穿透成 500，不能让它发生
         store.safe_unlink(click_path)
 
     return dst
@@ -1067,13 +1018,13 @@ def render(
 ) -> Path:
     """时间伸缩渲染 —— 预览与导出共用。
 
-    ``ratio > 1`` 变快（成品更短），``ratio < 1`` 变慢（成品更长），音高始终不变。
-    ``start`` / ``length`` 以**原曲时间轴**为准，只渲染其中一段时使用。
+    ``ratio > 1`` 变快（成品更短），``ratio < 1`` 变慢，音高始终不变。
+    ``start`` / ``length`` 以**原曲时间轴**为准。
 
-    给了 ``beat_times``（原曲时间轴秒数）就额外叠一层节拍声。注意顺序是
-    **先变速、再打点**（位置见 :func:`click_times`）—— 反过来的话 click 不会
-    落在成品的鼓点上。传空列表得到一个「有混音链路但没有 click」的对照版本，
-    校验脚本靠它把 click 单独减出来。
+    给了 ``beat_times``（原曲时间轴秒数）就额外叠一层节拍声。顺序是
+    **先变速、再打点**（见 :func:`click_times`），反过来 click 不会落在成品的
+    鼓点上。传空列表得到「有混音链路但没有 click」的对照版本，校验脚本靠它
+    把 click 单独减出来。
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1125,8 +1076,7 @@ def _render_with_click(
     if length is not None and length > 0:
         out_length = length / ratio
     else:
-        # 整首：拍点网格已经补齐到曲末，取最后一个拍点再留两秒余量。
-        # 多出来的部分会被 amix 的 duration=first 截掉，少了反而会掉尾巴。
+        # 整首：取最后一个拍点再留 2 秒余量；少了会掉尾巴，多了被 duration=first 截掉
         tail = float(beats_out[-1]) if beats_out.size else out_start
         out_length = (tail - out_start) + 2.0
 
@@ -1136,9 +1086,8 @@ def _render_with_click(
 
     codec_args, _ext = output_settings()
     try:
-        # 两路统一成同一采样率与声道布局，否则 amix 会因格式不一致报错。
-        # [0:a] 先按原曲时间轴截取（-ss/-t 是输入选项），再变速；
-        # [1:a] 是已经在「变速后时间轴」上摆好的 click 轨。
+        # 两路统一采样率/声道；[0:a] 先按原曲时间轴截取再变速，[1:a] 是
+        # 已在「变速后时间轴」上摆好的 click 轨
         fmt = f"aformat=sample_rates={sr}:channel_layouts=stereo"
         args: list[str] = ["-y"]
         if start is not None and start > 0:
@@ -1161,7 +1110,7 @@ def _render_with_click(
         ]
         _run_checked(args)
     finally:
-        # 中转的 click 轨只是顺手打扫，删不掉也不该让整次请求失败。
+        # 中转 click 轨只是顺手打扫
         store.safe_unlink(click_path)
 
     return dst
