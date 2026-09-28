@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 import tempfile
 import time
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -487,6 +489,65 @@ def main() -> int:
             check(f"第 {idx + 1} 段截取位置正确",
                   abs(got_freq - freq) < 40.0,
                   f"实际 {got_freq:.1f} Hz，期望 {freq:.0f} Hz")
+
+    print("\n--- 12. 批量上传（失败隔离） ---")
+    good2 = make_click_track(workdir / "click_140.wav", bpm=140.0, seconds=12.0)
+    bad = workdir / "broken.wav"
+    bad.write_bytes(b"\x00\x01" * 512)  # 损坏数据，探测必然失败
+
+    parts = []
+    for path in (src, good2, bad):
+        parts.append(("files", (path.name, BytesIO(path.read_bytes()), "audio/wav")))
+    res = requests.post(f"{BASE}/api/upload-many", files=parts, timeout=600)
+    check("批量上传 HTTP 200", res.status_code == 200, res.text[:200])
+    batch = res.json() if res.status_code == 200 else {}
+    if batch:
+        print(f"   成功 {batch['ok_count']} / 失败 {batch['fail_count']}")
+        check("2 成功 1 失败",
+              batch["ok_count"] == 2 and batch["fail_count"] == 1,
+              f"ok={batch['ok_count']} fail={batch['fail_count']}")
+        ok_items = [it for it in batch["items"] if it["ok"]]
+        bad_item = next((it for it in batch["items"] if not it["ok"]), None)
+        check("失败项是那个坏文件并带错误说明",
+              bad_item is not None and bad_item["name"] == bad.name and bool(bad_item.get("error")),
+              str(bad_item))
+        check("成功项结构与单文件上传一致",
+              all(k in item["data"] for item in ok_items
+                  for k in ("file_id", "detected_bpm", "duration")))
+        if len(ok_items) >= 2:
+            check("批量第 2 首 BPM 接近 140",
+                  abs(ok_items[1]["data"]["detected_bpm"] - 140.0) < 4.0,
+                  f"实际 {ok_items[1]['data']['detected_bpm']}")
+
+    print("\n--- 13. zip 打包下载 ---")
+    res = requests.post(f"{BASE}/api/export",
+                        json=dict(base_payload, target_spm=130), timeout=600)
+    check("导出一个成品用于打包", res.status_code == 200, res.text[:200])
+    if res.status_code == 200:
+        # PackageItem.name 要的是 OUTPUT_DIR 里的实际文件名；响应里的 filename
+        # 是下载显示名，两者不同 —— 实际名从 url（/media/output/<名>）取。
+        fname = res.json()["url"].rsplit("/", 1)[-1]
+        res = requests.post(f"{BASE}/api/package", json={
+            "items": [{"name": fname}, {"name": "不存在的成品.mp3"}],
+            "zip_name": "e2e_batch",
+        }, timeout=120)
+        check("打包 HTTP 200", res.status_code == 200, res.text[:200])
+        if res.status_code == 200:
+            pk = res.json()
+            print(f"   zip: {pk['filename']}  条目 {pk['count']}  {pk['bytes']} 字节")
+            check("只打包真实存在的成品（缺失的跳过）", pk["count"] == 1, f"count={pk['count']}")
+            check("文件名用 zip_name 生成", pk["filename"] == "e2e_batch.zip", pk["filename"])
+            zbytes = requests.get(f"{BASE}{pk['download_url']}", timeout=180).content
+            check("zip 可下载且字节数一致",
+                  len(zbytes) == pk["bytes"] and len(zbytes) > 1000,
+                  f"{len(zbytes)} vs {pk['bytes']}")
+            with zipfile.ZipFile(BytesIO(zbytes)) as archive:
+                check("zip 内条目正确", archive.namelist() == [fname], str(archive.namelist()))
+                check("zip 完整性（CRC）通过", archive.testzip() is None)
+
+    res = requests.post(f"{BASE}/api/package",
+                        json={"items": [{"name": "压根没有.mp3"}]}, timeout=60)
+    check("一个成品都没有返回 404", res.status_code == 404, f"实际 {res.status_code}")
 
     print("\n" + "=" * 62)
     if failures:
