@@ -13,14 +13,15 @@ const MIN_CLIP_SEC = 5.0;    // 选区最短长度，与后端 config.MIN_CLIP_S
 const CLIP_TAIL_SEC = 5.0;   // 改终点时从「终点前这么多秒」开始试听，专门听收尾
 
 const MAX_BATCH = 20;   // 与后端 config.MAX_BATCH_FILES 保持一致
+const FADE_MAX = 3.0;   // 开头渐入时长上限（秒），与后端 config.MAX_FADE_SEC 保持一致
 
 const state = {
   track: null,
   sourceBpm: null,
   spm: 170,
   mapping: '1:1',
-  minRatio: 0.85,
-  maxRatio: 1.15,
+  minRatio: 0.5,
+  maxRatio: 2.0,
   metroGain: 0.5,       // 节拍声音量，试听与导出共用
   busy: false,
   // 裁剪区间（原曲时间轴）。end = null 表示一路到曲末，也就是「没裁剪」。
@@ -665,6 +666,19 @@ function clipActive() {
   return r.start > 0.05 || r.end < trackDuration() - 0.05;
 }
 
+/* 开头渐进切入的时长：没勾就是 0（不淡入），勾了取输入框的值并夹在上限内。 */
+function fadeSeconds() {
+  if (!$('clipFade').checked) return 0;
+  const v = Number($('clipFadeSec').value);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return Math.min(v, FADE_MAX);
+}
+
+/* 没勾时把时长框置灰 —— 留着可编辑会让人以为改它有用。 */
+function syncFadeUI() {
+  $('clipFadeSec').disabled = !$('clipFade').checked;
+}
+
 /* 找离 t 最近的拍点。刻意**不设**固定吸附半径 —— 半径小于半个拍距时会出现
  * 「这次吸上、下次吸不上」的薛定谔行为。始终取最近一拍，偏移最多半拍。 */
 function snapToBeat(t) {
@@ -876,6 +890,11 @@ function repositionAfterClip(anchor) {
     // 正在放：跳到新位置接着放
     try { liveAudio.currentTime = t; } catch (e) { /* 元数据未就绪时忽略 */ }
     armClickSettle();               // 位置跳了：排出去的 click 作废，等媒体时钟稳下来再对准
+    // 跳到新起点等于从这一段的开头接着放，和点「试听这段」是同一种开头，也该渐入；
+    // 拖终点落在终点前 5 秒（不是段首）就照旧直接切进去，别把收尾也淡一遍。
+    const fade = anchor === 'start' ? fadeSeconds() : 0;
+    if (fade > 0) startMusicFade(fade);
+    else clearMusicFade();          // 落点不是段首：把可能只跑了一半的渐入收掉，音量拉回满值
     WAVE.time = t;
     updateWaveView();
     drawWave();
@@ -915,7 +934,7 @@ function defaultParams(data) {
     previewMetro: false,
     exportMetro: false,
     keepPitch: true,
-    clip: { start: 0, end: null },
+    clip: { start: 0, end: null, fade: false, fadeSec: data.defaults.fade_sec },
   };
 }
 
@@ -934,7 +953,13 @@ function snapshotCurrent() {
     previewMetro: $('previewMetro').checked,
     exportMetro: $('exportMetro').checked,
     keepPitch: $('keepPitch').checked,
-    clip: { start: state.clip.start, end: state.clip.end },
+    // 时长存输入框里的原始数字（不是 fadeSeconds() 的结果）—— 没勾时也要记住填了多少
+    clip: {
+      start: state.clip.start,
+      end: state.clip.end,
+      fade: $('clipFade').checked,
+      fadeSec: Number($('clipFadeSec').value) || 1,
+    },
   };
 }
 
@@ -950,9 +975,12 @@ function restoreInto(index) {
   state.maxRatio = p.maxRatio;
   state.metroGain = p.metroGain;
   state.clip = { start: p.clip.start, end: p.clip.end };
+  $('clipFade').checked = !!p.clip.fade;
+  $('clipFadeSec').value = String(p.clip.fadeSec || 1);
   $('previewMetro').checked = p.previewMetro;
   $('exportMetro').checked = p.exportMetro;
   $('keepPitch').checked = p.keepPitch;
+  syncFadeUI();
 }
 
 /* 换编辑对象的**唯一入口**（列表点行、上传完自动进入都走这里）。
@@ -993,69 +1021,89 @@ async function handleFiles(fileList) {
 
   state.busy = true;
   $('dropzone').classList.remove('over');
-  setDropzoneBusy(batch.length);
+  // 上传中锁住清空按钮：异步循环还握着下标，中途清空会让它写进新列表
+  $('clearListBtn').disabled = true;
 
-  try {
-    const form = new FormData();
-    batch.forEach((f) => form.append('files', f));
-    const res = await fetch('/api/upload-many', { method: 'POST', body: form });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `上传失败（HTTP ${res.status}）`);
+  // 先把整批以「排队」状态进列表 —— 用户立刻看到这批都有谁、正在处理第几首
+  const startIndex = state.files.length;
+  batch.forEach((f) => {
+    state.files.push({ name: f.name, status: 'wait', checked: false, params: null });
+  });
+  renderFileList();
 
-    let firstNew = -1;
-    (data.items || []).forEach((item) => {
-      if (item.ok) {
-        state.files.push({
-          ...item.data,
-          params: defaultParams(item.data),
-          checked: true,
-          status: 'ok',
-        });
-        if (firstNew < 0) firstNew = state.files.length - 1;
-      } else {
-        // 失败的那条也进列表：用户需要知道是哪些、为什么，才好决定重传还是放弃
-        state.files.push({
-          name: item.name,
-          status: 'fail',
-          error: item.error || '处理失败',
-          checked: false,
-          params: null,
-        });
-      }
-    });
+  // 逐首上传：每完成一首就刷新列表，进度是真实的（后端本来就是串行逐首处理，
+  // 一次传整批反而拿不到中间进度）。单首失败只记自己，不影响后面的排队。
+  let okCount = 0;
+  let failCount = 0;
+  let firstNew = -1;
 
+  for (let k = 0; k < batch.length; k++) {
+    const row = startIndex + k;
+    state.files[row].status = 'loading';
+    setDropzoneBusy(k + 1, batch.length, batch[k].name);
     renderFileList();
-    if (firstNew >= 0) {
-      // 第一首成功的自动进编辑器。先退回 -1，否则 switchTo 会因「下标没变」直接返回。
-      const keep = state.current;
-      state.current = -1;
-      switchTo(firstNew);
-      if (keep >= 0 && keep < state.files.length && keep !== firstNew) {
-        // 之前已经在编辑某首的话，不动它，切回原来那首
-        switchTo(keep);
+
+    try {
+      const form = new FormData();
+      form.append('file', batch[k]);
+      const res = await fetch('/api/upload', { method: 'POST', body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `上传失败（HTTP ${res.status}）`);
+
+      state.files[row] = {
+        ...data,
+        params: defaultParams(data),
+        checked: true,
+        status: 'ok',
+      };
+      okCount++;
+
+      // 第一首成功且当前没在编辑别的歌时，立刻进编辑器 ——
+      // 后面的继续排队处理，用户不用等整批跑完才开始干活
+      if (state.current < 0 && firstNew < 0) {
+        firstNew = row;
+        state.current = -1;
+        switchTo(row);
       }
+    } catch (err) {
+      state.files[row] = {
+        name: batch[k].name,
+        status: 'fail',
+        error: err.message || '处理失败',
+        checked: false,
+        params: null,
+      };
+      failCount++;
     }
-    if (data.fail_count) {
-      toast(`处理完成：成功 ${data.ok_count} 首，失败 ${data.fail_count} 首`, 'warn');
-    } else {
-      toast(`处理完成：${data.ok_count} 首已就绪`, 'info');
-    }
-  } catch (err) {
-    toast(err.message || '上传失败', 'error');
-  } finally {
-    state.busy = false;
-    setDropzoneBusy(0);
+    renderFileList();
   }
+
+  if (failCount) {
+    toast(`处理完成：成功 ${okCount} 首，失败 ${failCount} 首`, 'warn');
+  } else {
+    toast(`处理完成：${okCount} 首已就绪`, 'info');
+  }
+
+  state.busy = false;
+  setDropzoneBusy(0);
+  $('clearListBtn').disabled = false;
+  renderFileList();
 }
 
-/* 上传区的忙碌提示。文案带上数量 —— 传多首时用户最想知道「一共要处理几个」。 */
-function setDropzoneBusy(count) {
+/* 上传区的忙碌提示。逐首上传时带上「第几首 / 共几首」和歌名 ——
+ * 批量时用户最想知道的就是进度到哪儿了。 */
+function setDropzoneBusy(done, total, name) {
   const big = $('dropzone').querySelector('.big');
   const sub = $('dropzone').querySelector('.sub');
   if (!big || !sub) return;
-  if (count > 0) {
-    big.textContent = count > 1 ? `正在处理 ${count} 个文件…` : '正在上传并分析节拍…';
-    sub.textContent = '每个文件都要单独检测节拍，请稍等';
+  if (done > 0 && total > 1) {
+    big.textContent = `正在处理 ${done} / ${total} 首…`;
+    sub.textContent = `当前：${name}`;
+    return;
+  }
+  if (done > 0) {
+    big.textContent = '正在上传并分析节拍…';
+    sub.textContent = '检测完就出结果，请稍等';
     return;
   }
   big.textContent = '把音频文件拖到这里';
@@ -1140,8 +1188,10 @@ function renderFileList() {
     return;
   }
 
-  $('listSum').textContent =
-    `${state.files.length} 首 · 已选 ${checked.length} 首 · 可导出 ${okList.length} 首`;
+  // 上传中把汇总行让给进度：几首里完成了几首，一眼看到还剩多少
+  $('listSum').textContent = state.busy
+    ? `正在处理…（${okList.length} / ${state.files.length} 完成）`
+    : `${state.files.length} 首 · 已选 ${checked.length} 首 · 可导出 ${okList.length} 首`;
   $('fileList').innerHTML = state.files.map(fileRowHtml).join('');
   $('applyAllBtn').disabled = state.current < 0;
 
@@ -1152,6 +1202,20 @@ function fileRowHtml(f, i) {
   const on = i === state.current ? ' on' : '';
 
   // 失败的行没有勾选框、也点不进编辑器 —— 留个等宽空位让各列对齐
+  // 排队中 / 分析中：没有勾选框、点不进编辑器，状态列给动画
+  if (f.status === 'wait' || f.status === 'loading') {
+    const loading = f.status === 'loading';
+    return `<div class="file-row" data-i="${i}" data-wait="1">
+      <span style="flex:none;width:15px"></span>
+      <div class="fr-main">
+        <div class="fr-name">${escapeHtml(f.name)}</div>
+        <div class="fr-meta">${loading ? '<span class="spin"></span>正在上传并检测节拍…' : '排队等待处理'}</div>
+      </div>
+      <div class="fr-bpm"><b>—</b></div>
+      <div class="fr-state ${loading ? 'loading' : 'wait'}">${loading ? '分析中' : '排队中'}</div>
+    </div>`;
+  }
+
   if (f.status !== 'ok') {
     return `<div class="file-row${on}" data-i="${i}" data-fail="1">
       <span style="flex:none;width:15px"></span>
@@ -1360,6 +1424,7 @@ function clickOutput(ctx) {
  * 故结果缓存；接入失败退回原生输出，至少保证有声音。 */
 let musicSource = null;      // 音乐接入音频图的入口（同时也是「已接入」的标记）
 let musicBus = null;         // 音乐总音量，保持 1.0，音量仍旧由 liveAudio.volume 决定
+let fadeTimer = null;        // 试听渐入的定时器（见 startMusicFade）
 
 function musicAttached() {
   return !!musicSource;
@@ -1383,6 +1448,31 @@ function attachMusicToGraph() {
     musicBus = null;
     return false;
   }
+}
+
+/* 试听的开头渐入：拉媒体元素自己的音量，不走音频图。
+ * 音频图得等上下文 running 才接得上（首次点击常常来不及），靠它的增益自动化
+ * 会出现「第一次点没效果」的薛定谔行为；volume 是同步赋值的，一定生效。
+ * 就算此时音乐已接进音频图也不冲突 —— volume 作用在图的上游。 */
+function startMusicFade(sec) {
+  clearMusicFade();
+  if (sec <= 0) return;
+  const t0 = performance.now();
+  liveAudio.volume = 0;
+  fadeTimer = setInterval(() => {
+    const k = (performance.now() - t0) / (sec * 1000);
+    if (k >= 1) { clearMusicFade(); return; }   // 淡完顺手把定时器收掉
+    liveAudio.volume = k;
+  }, 50);
+}
+
+/* 停止/暂停时复位，否则下次会从半路音量接着播，听着像声音突然小了。 */
+function clearMusicFade() {
+  if (fadeTimer !== null) {
+    clearInterval(fadeTimer);
+    fadeTimer = null;
+  }
+  liveAudio.volume = 1;
 }
 
 /* 音乐接进音频图后原生输出那条路就不走了，音频上下文被系统挂起时音乐会直接哑掉。
@@ -1579,6 +1669,21 @@ startClickTicker();
 
 /* ------------------------------------------------------------ 播放 */
 
+/* 「同一时刻只允许一路出声」的守门人：音乐、节拍对齐、试听叠加的节拍声三者互斥。
+ * 任何「开始播放」之前都必须先调一次 —— 它把当前在响的全部掐掉，并推进播放代次，
+ * 让在途的异步起播作废（节拍片段要先在后端生成，那几秒里用户可能已经改了主意）。 */
+let playToken = 0;
+
+function haltAudio() {
+  playToken++;
+  stopScheduledClicks();
+  try { liveAudio.pause(); } catch (e) { /* noop */ }
+  try { metroAudio.pause(); } catch (e) { /* noop */ }
+  clearMusicFade();               // 半截渐入要复位，否则音量会卡在中间值
+  setMetroBtn(false);
+  setActive(null);
+}
+
 function resetPlayer() {
   clearTimeout(seekDebounce);
   clearTimeout(bpmDebounce);
@@ -1590,6 +1695,7 @@ function resetPlayer() {
   setActive(null);
   try { liveAudio.pause(); } catch (e) { /* noop */ }
   try { metroAudio.pause(); } catch (e) { /* noop */ }
+  clearMusicFade();
   liveAudio.removeAttribute('src');
   metroAudio.removeAttribute('src');
   delete liveAudio.dataset.src;
@@ -1640,18 +1746,22 @@ async function playLive() {
   if (!state.track) return;
   const plan = computePlan();
 
-  stopScheduledClicks();
-  metroAudio.pause();
-  setMetroBtn(false);
+  haltAudio();                    // 让出播放权：节拍对齐、上一路试听、半截渐入一起停
   unlockAudio();                  // 趁着这次点击，把音频上下文解锁掉
+
+  const start = seekStartSeconds();
+  // 只在「从选区起点开始放」时渐入。拖进度条到中间再播是跳着听，不该再淡一次。
+  const wantFade = fadeSeconds();
+  const fade = wantFade > 0 && Math.abs(start - clipRange().start) < 0.3 ? wantFade : 0;
   if (previewMetronomeOn()) {     // 要叠节拍声，就把音乐接进同一张音频图（对不上的根因就在这）
     attachMusicToGraph();
   }
+  if (fade > 0) liveAudio.volume = 0;   // 先压到静音，等真播起来了再往上拉
+
   ensureLiveSource();
   setPreservesPitch(liveAudio, $('keepPitch').checked);
   liveAudio.playbackRate = plan.ratio;
 
-  const start = seekStartSeconds();
   if (Math.abs(liveAudio.currentTime - start) > 0.4) {
     try { liveAudio.currentTime = start; } catch (e) { /* 元数据未就绪时忽略 */ }
   }
@@ -1659,9 +1769,11 @@ async function playLive() {
   try {
     await liveAudio.play();
   } catch (err) {
+    clearMusicFade();              // 没播起来，别把音量留在 0
     toast('浏览器阻止了播放，再点一次试试', 'error');
     return;
   }
+  if (fade > 0) startMusicFade(fade);
 
   armClickSettle();               // 等媒体时钟稳下来再对准，从当前位置往后的 click 才对得上
   setActive('live');
@@ -1674,11 +1786,15 @@ async function playLive() {
   showNowPlaying('live', liveLabel(plan.ratio));
 }
 
-/* 裁剪卡片的试听：正在试听就停，否则从进度条那一点开始放（已是 anchor 位置，无需计算）。
- * 走同一套播放链路，变速、节拍声开关、播到选区末尾自动停，全部自动一致。 */
+/* 裁剪卡片的试听：正在试听就停，否则**从段首**开始放（先把进度条归位）。
+ * 必须归位：playLive 是按「进度条那一点」起播的，而进度条播过一次或拖过之后
+ * 就停在中间 —— 那时点它会从半截开始放，既听不到这段的开头（用户点它本就是想
+ * 听开头接得顺不顺），渐入也会被当成「跳着听」而跳过。想从中间接着听走播放条。
+ * 其它方面走同一套播放链路：变速、节拍声开关、播到选区末尾自动停，全部一致。 */
 function toggleClipPreview() {
   if (!state.track) return;
   if (activeMode === 'live' && !liveAudio.paused) { stopAll(); return; }
+  syncSeekBar(clipRange().start);
   playLive();
 }
 
@@ -1691,10 +1807,7 @@ function autoUpdatePlaying() {
 
 function stopAll() {
   clearTimeout(seekDebounce);
-  stopScheduledClicks();
-  liveAudio.pause();
-  metroAudio.pause();
-  setActive(null);
+  haltAudio();                    // 停声、推进代次、恢复按钮与播放条状态都在里面
   const t = seekStartSeconds();
   try { liveAudio.currentTime = t; } catch (e) { /* noop */ }
   WAVE.time = t;
@@ -1702,7 +1815,6 @@ function stopAll() {
   if (state.track) WAVE.windowSec = waveWindow();
   updateWaveView();
   stopWave();
-  setMetroBtn(false);
 }
 
 /* ------------------------------------------------------------ 听节拍对齐 */
@@ -1733,6 +1845,10 @@ async function toggleMetronome() {
   const start = Math.min(seekStartSeconds(), Math.max(r.start, r.end - 1));
   const d = state.track.defaults;
   const length = Math.min((d && d.metronome_length) || 15, Math.max(1, r.end - start));
+  // 就在发请求之前让出播放权：音乐立刻停，不用等后端把片段生成出来（首次要好几秒）。
+  // 记下代次，生成期间用户若点了停止或换了播放源，这次结果就作废，别把用户的操作盖掉。
+  haltAudio();
+  const token = playToken;
   setBtnLoading(btn, true, '生成中');
 
   try {
@@ -1748,9 +1864,7 @@ async function toggleMetronome() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `生成失败（HTTP ${res.status}）`);
-
-    stopScheduledClicks();
-    liveAudio.pause();
+    if (token !== playToken) return;   // 生成期间用户点了停止/换了播放源 → 本次作废
 
     if (metroAudio.dataset.src !== data.url) {
       metroAudio.dataset.src = data.url;
@@ -1810,6 +1924,7 @@ async function doExport() {
         // 选了区间就只生成这一段；没选就按整首
         start: clip.start,
         length: clipping ? clip.length : null,
+        fade_in: fadeSeconds(),
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -1835,6 +1950,9 @@ function renderExportResult(d) {
     ? `<div class="row"><span>裁剪</span><b>${formatTime(d.clip_start)} → `
       + `${formatTime(d.clip_start + d.clip_length)}（共 ${formatTime(d.clip_length)}）</b></div>`
     : '';
+  const fadeNote = d.fade_sec > 0
+    ? `<div class="row"><span>开头渐入</span><b>前 ${d.fade_sec.toFixed(1)} 秒从静音淡上来</b></div>`
+    : '';
   const inDur = d.clip_length == null ? d.source_duration : d.clip_length;
 
   $('exportResult').innerHTML = `
@@ -1843,6 +1961,7 @@ function renderExportResult(d) {
       <div class="row"><span>倍率</span><b>×${d.ratio.toFixed(3)}（${d.mapping}）</b></div>
       <div class="row"><span>实际步频</span><b>${d.actual_spm} spm</b></div>
       ${clipNote}
+      ${fadeNote}
       <div class="row"><span>时长</span><b>${formatTime(inDur)} → ${formatTime(d.output_duration)}</b></div>
       ${metroNote}
       ${clampNote}
@@ -1881,6 +2000,7 @@ async function exportOne(entry) {
       metronome_gain: p.metroGain,
       start: p.clip.start,
       length: clipLen,
+      fade_in: p.clip.fade ? Number(p.clip.fadeSec) || 0 : 0,
     }),
   });
   const data = await res.json().catch(() => ({}));
@@ -1889,6 +2009,11 @@ async function exportOne(entry) {
 }
 
 async function batchExport() {
+  // 上传还没跑完就导出的话，勾选集里少算还没处理完的歌，用户会以为丢了几首
+  if (state.busy) {
+    toast('还有文件在处理中，等列表里没有「排队中 / 分析中」再导出', 'warn');
+    return;
+  }
   const picked = state.files.filter((f) => f.status === 'ok' && f.checked);
   if (!picked.length) {
     toast('先勾选要导出的文件', 'error');
@@ -2003,6 +2128,7 @@ function renderBatchResult(done, failed) {
 
 $('dropzone').addEventListener('click', () => $('fileInput').click());
 $('changeFileBtn').addEventListener('click', () => $('fileInput').click());
+$('topAddBtn').addEventListener('click', () => $('fileInput').click());
 
 $('fileInput').addEventListener('change', (e) => {
   if (e.target.files && e.target.files.length) handleFiles(e.target.files);
@@ -2024,6 +2150,10 @@ $('fileList').addEventListener('click', (e) => {
   }
   if (row.dataset.fail) {
     toast(entry.error || '这个文件没能处理成功', 'error');
+    return;
+  }
+  if (row.dataset.wait) {
+    toast(entry.status === 'loading' ? '这首正在处理，马上就好' : '这首还在排队，前面处理完就轮到它', 'info');
     return;
   }
   switchTo(idx);
@@ -2193,6 +2323,18 @@ $('clipResetBtn').addEventListener('click', () => {
   if (!state.track) return;
   setClip(0, trackDuration(), false);
   repositionAfterClip('start');
+});
+
+$('clipFade').addEventListener('change', () => {
+  syncFadeUI();
+  // 播放中途取消勾选：渐入可能只跑了一半，把音量拉回原值
+  if (!$('clipFade').checked) clearMusicFade();
+});
+
+$('clipFadeSec').addEventListener('change', () => {
+  const v = Number($('clipFadeSec').value);
+  if (!Number.isFinite(v) || v <= 0) $('clipFadeSec').value = '1';
+  else if (v > FADE_MAX) $('clipFadeSec').value = String(FADE_MAX);
 });
 
 $('clipPreviewBtn').addEventListener('click', toggleClipPreview);
@@ -2580,6 +2722,9 @@ fetch('/api/health')
 // 顺带把 data/ 的占用拉回来，「缓存与数据」的标题栏一进页面就有数字
 loadStorage();
 
+// 没勾「渐进切入」时，时长框一开始就该是灰的
+syncFadeUI();
+
 /* 调试出口：把内部状态与渲染函数挂到 window，
    便于本地预览、截图与排查问题（不影响正常使用）。 */
 window.__runbeat = {
@@ -2620,6 +2765,9 @@ window.__runbeat = {
   clipAnchorTime,
   repositionAfterClip,
   toggleClipPreview,
+  fadeSeconds,
+  syncFadeUI,
+  previewVolume: () => liveAudio.volume,
   // 缓存与数据（测试脚本要能直接驱动面板，不想只靠点按钮）
   CACHE_KINDS,
   formatBytes,

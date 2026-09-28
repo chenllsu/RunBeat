@@ -76,6 +76,10 @@ class StretchRequest(BaseModel):
     # 预览与导出共用这套字段，区别只在「长度留空时算多长」——见 _clip_window。
     start: float = Field(0.0, ge=0, description="从原曲第几秒开始处理")
     length: float | None = Field(None, gt=0, description="处理多少秒，缺省见各接口")
+    # 开头渐入秒数，0 = 不渐入。界面上是「渐进切入」勾选框 + 时长输入框的组合。
+    fade_in: float = Field(
+        0.0, ge=0, le=config.MAX_FADE_SEC, description="成品开头渐入几秒，0 为不渐入"
+    )
 
 
 class MetronomeRequest(BaseModel):
@@ -166,6 +170,17 @@ def _clip_window(
             f"这一段只剩 {length:.1f} 秒了，至少要 {config.MIN_CLIP_SEC:.0f} 秒才能听出节奏",
         )
     return start, length
+
+
+def _fade_seconds(req: StretchRequest, out_duration: float) -> float:
+    """实际生效的淡入秒数：夹在上限内，且不超过成品时长的一半。
+
+    最短的片段只有 ``MIN_CLIP_SEC`` 秒，淡入占了整段的话听着像「一直没进来」——
+    宁可淡得短一点，也不要让整段都在渐强。
+    """
+    if req.fade_in <= 0 or out_duration <= 0:
+        return 0.0
+    return round(min(float(req.fade_in), config.MAX_FADE_SEC, out_duration / 2.0), 3)
 
 
 def _beats_for(record: dict, bpm: float) -> dict:
@@ -367,6 +382,8 @@ async def _ingest_one(file: UploadFile) -> dict:
             "preview_length": config.PREVIEW_LENGTH_SEC,
             "wave_window": config.WAVE_WINDOW_SEC,
             "metronome_length": config.METRONOME_LENGTH_SEC,
+            "fade_sec": config.DEFAULT_FADE_SEC,
+            "fade_max": config.MAX_FADE_SEC,
         },
     }
 
@@ -497,8 +514,11 @@ async def preview(req: StretchRequest) -> dict:
     start, length = _clip_window(req, total, fallback=config.PREVIEW_LENGTH_SEC)
 
     want_click = bool(req.metronome and req.metronome_gain > 0)
+    out_duration = audio.scaled_duration(length, plan.ratio)
+    fade_sec = _fade_seconds(req, out_duration)
     key = store.cache_key(
-        req.file_id, start, length, plan.ratio, req.metronome_gain if want_click else None
+        req.file_id, start, length, plan.ratio,
+        req.metronome_gain if want_click else None, fade_sec,
     )
     _codec_args, ext = audio.output_settings()
     target = config.PREVIEW_DIR / f"{key}{ext}"
@@ -527,6 +547,8 @@ async def preview(req: StretchRequest) -> dict:
                 beats,
                 req.mapping,
                 req.metronome_gain,
+                None,
+                fade_sec,
             )
         except Exception as exc:
             store.safe_unlink(target)
@@ -537,7 +559,8 @@ async def preview(req: StretchRequest) -> dict:
         "cached": cached,
         "start": round(start, 3),
         "length": round(length, 3),
-        "output_length": round(audio.scaled_duration(length, plan.ratio), 3),
+        "fade_sec": fade_sec,
+        "output_length": round(out_duration, 3),
         "ratio": plan.ratio,
         "requested_ratio": plan.requested_ratio,
         "actual_spm": plan.actual_spm,
@@ -574,11 +597,17 @@ async def export(req: StretchRequest) -> dict:
             audio.scaled_duration(length, plan.ratio),
         )
 
+    out_duration = audio.scaled_duration(length, plan.ratio)
+    fade_sec = _fade_seconds(req, out_duration)
+
     _codec_args, ext = audio.output_settings()
-    # 文件名带上节拍声与区间两维，否则「带/不带 click」「整首/片段」互相覆盖
+    # 文件名带上节拍声、区间、淡入三维，否则同一首歌换个设置会互相覆盖
     tag = f"_m{int(round(req.metronome_gain * 100)):03d}" if want_click else ""
     clip_tag = f"_c{_mmss(start)}-{_mmss(start + length)}" if clipped else ""
-    target = config.OUTPUT_DIR / f"{req.file_id}_{int(plan.ratio * 1000):04d}{tag}{clip_tag}{ext}"
+    fade_tag = f"_f{int(round(fade_sec * 10)):02d}" if fade_sec > 0 else ""
+    target = config.OUTPUT_DIR / (
+        f"{req.file_id}_{int(plan.ratio * 1000):04d}{tag}{clip_tag}{fade_tag}{ext}"
+    )
 
     started = time.time()
     try:
@@ -593,12 +622,13 @@ async def export(req: StretchRequest) -> dict:
             beats,
             req.mapping,
             req.metronome_gain,
+            None,
+            fade_sec,
         )
     except Exception as exc:
         store.safe_unlink(target)
         raise HTTPException(500, f"生成失败：{exc}") from exc
 
-    out_duration = audio.scaled_duration(length, plan.ratio)
     stem = Path(record["original_name"]).stem[:40] or "runbeat"
     range_suffix = f"_{_mmss(start)}-{_mmss(start + length)}" if clipped else ""
     download_name = (
@@ -621,6 +651,7 @@ async def export(req: StretchRequest) -> dict:
         "clip_start": round(start, 3),
         "clip_length": round(length, 3),
         "clipped": clipped,
+        "fade_sec": fade_sec,
         "output_duration": round(out_duration, 2),
         "metronome": want_click,
         "metronome_gain": round(req.metronome_gain, 3) if want_click else 0.0,

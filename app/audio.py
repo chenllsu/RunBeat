@@ -1005,6 +1005,15 @@ def atempo_chain(ratio: float) -> str:
     return ",".join(parts)
 
 
+def fade_filter(sec: float) -> str:
+    """开头渐入的滤镜串，``sec <= 0`` 时返回空串。
+
+    必须挂在 ``atempo`` **之后**：那样 ``st=0`` 指的是成品时间轴的开头，
+    淡入时长就等于用户设的秒数；放前面会被倍率缩放。
+    """
+    return f",afade=t=in:st=0:d={sec:.3f}" if sec > 0 else ""
+
+
 def render(
     src: Path,
     dst: Path,
@@ -1015,11 +1024,13 @@ def render(
     mapping: str = "1:1",
     click_gain: float | None = None,
     bed_gain: float | None = None,
+    fade_sec: float = 0.0,
 ) -> Path:
     """时间伸缩渲染 —— 预览与导出共用。
 
     ``ratio > 1`` 变快（成品更短），``ratio < 1`` 变慢，音高始终不变。
-    ``start`` / ``length`` 以**原曲时间轴**为准。
+    ``start`` / ``length`` 以**原曲时间轴**为准。``fade_sec > 0`` 时成品开头
+    从静音渐入这么长，用来软化裁剪出来的硬起点。
 
     给了 ``beat_times``（原曲时间轴秒数）就额外叠一层节拍声。顺序是
     **先变速、再打点**（见 :func:`click_times`），反过来 click 不会落在成品的
@@ -1030,7 +1041,8 @@ def render(
 
     if beat_times is not None:
         return _render_with_click(
-            src, dst, ratio, start, length, beat_times, mapping, click_gain, bed_gain
+            src, dst, ratio, start, length, beat_times, mapping,
+            click_gain, bed_gain, fade_sec,
         )
 
     args: list[str] = ["-y"]
@@ -1045,7 +1057,7 @@ def render(
     args += [
         "-vn",
         "-map_metadata", "-1",
-        "-filter:a", atempo_chain(ratio),
+        "-filter:a", f"{atempo_chain(ratio)}{fade_filter(fade_sec)}",
         *codec_args,
         str(dst),
     ]
@@ -1063,8 +1075,13 @@ def _render_with_click(
     mapping: str,
     click_gain: float | None,
     bed_gain: float | None,
+    fade_sec: float = 0.0,
 ) -> Path:
-    """变速 + 叠节拍声。两条路都按同一套滤镜走，保证试听与成品的听感一致。"""
+    """变速 + 叠节拍声。两条路都按同一套滤镜走，保证试听与成品的听感一致。
+
+    渐入挂在混音结果上，所以 music 和 click 会一起淡进来 —— 起点那一声 click
+    跟着渐强，比单独淡音乐更自然。
+    """
     import soundfile as sf  # 延迟导入，和 librosa 保持一致的做法
 
     gain = config.METRONOME_GAIN if click_gain is None else float(click_gain)
@@ -1101,7 +1118,7 @@ def _render_with_click(
             f"[0:a]volume={bed:.3f},{fmt},{atempo_chain(ratio)}[a0];"
             f"[1:a]{fmt},volume={gain:.3f}[c];"
             "[a0][c]amix=inputs=2:duration=first:normalize=0,"
-            f"alimiter=limit={config.METRONOME_LIMIT:.3f}[a]",
+            f"alimiter=limit={config.METRONOME_LIMIT:.3f}{fade_filter(fade_sec)}[a]",
             "-map", "[a]",
             "-vn",
             "-map_metadata", "-1",

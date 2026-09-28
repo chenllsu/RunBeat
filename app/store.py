@@ -58,13 +58,16 @@ def cache_key(
     length: float,
     ratio: float,
     click_gain: float | None = None,
+    fade_sec: float = 0.0,
 ) -> str:
-    """预览缓存键：文件 + 位置 + 倍率 + 节拍声音量（若开启）——
-    漏掉节拍声这一维，勾开关后会命中旧缓存，听着像开关坏了。
+    """预览缓存键：文件 + 位置 + 倍率 + 节拍声音量（若开启）+ 淡入时长 ——
+    漏掉其中任何一维，改完设置会命中旧缓存，听着像开关坏了。
     """
     raw = f"{file_id}|{start:.3f}|{length:.3f}|{ratio:.6f}"
     if click_gain is not None:
         raw += f"|click{click_gain:.3f}"
+    if fade_sec > 0:
+        raw += f"|fade{fade_sec:.2f}"
     return "prev_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 

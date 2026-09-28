@@ -8,7 +8,15 @@
   --muted: #8b98a5;
   --dim: #5d6b7a;
   --accent: #22d3a6;
+  /* 主按钮渐变的两端。原来拿 --accent 和相近的青色拼，色差太小、跟纯色没区别；
+   * 改成「深青绿 → 亮青绿」，靠明度差拉开，一眼能看出是渐变，又不偏离青绿基调。 */
+  --accent-deep: #12b892;
+  --accent-2: #5cecc0;
+  /* --accent 的 RGB 分量，给需要带透明度的场合用（glow / 波形填充）。
+   * canvas 读不到 CSS 变量名，波形绘制也靠它。 */
+  --accent-rgb: 34, 211, 166;
   --accent-ink: #04241c;
+  --grad: linear-gradient(135deg, var(--accent-deep), var(--accent-2));
   --warn: #f5a524;
   --danger: #f2555a;
   --radius: 14px;
@@ -34,30 +42,136 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
-.wrap {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 40px 20px 80px;
+/* ----------------------------------------------------------- 骨架
+ * 顶栏 + 双栏：左栏歌曲库常驻，右栏编辑器独立滚动。
+ * 页面本身不滚（body 高度锁死），滚的是右栏 —— 顶栏和左栏永远看得见，
+ * 调完步频不用滚回去就能点波形下面的试听。 */
+
+html, body { height: 100%; }
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
 }
 
-header.top {
-  margin-bottom: 28px;
+.topbar {
+  flex: 0 0 auto;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  position: relative;
 }
 
-header.top h1 {
+/* 顶栏底缘一道极细的活力线：常驻区不至于太平 */
+.topbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent));
+  opacity: .5;
+}
+
+.topbar .logo {
   margin: 0;
-  font-size: 26px;
+  font-size: 20px;
   font-weight: 600;
-  letter-spacing: -0.4px;
+  letter-spacing: -.4px;
 }
 
-header.top h1 span { color: var(--accent); }
-
-header.top p {
-  margin: 6px 0 0;
-  color: var(--muted);
-  font-size: 14px;
+.topbar .logo span {
+  background: var(--grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
+
+.topbar .slogan {
+  color: var(--dim);
+  font-size: 13px;
+  border-left: 1px solid var(--line);
+  padding-left: 14px;
+}
+
+.tb-spacer { flex: 1; }
+
+.layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 296px minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px 20px 0;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding-bottom: 16px;
+}
+
+/* 右栏自己滚（整页高度锁死），左栏和顶栏不跟着动 */
+.main {
+  min-width: 0;
+  overflow-y: auto;
+  padding-bottom: 40px;
+}
+
+/* ----------------------------------------------------------- 左栏歌曲库 */
+
+.side-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  overflow: hidden;
+}
+
+.side-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.side-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
+
+.side-hint {
+  flex: 0 0 auto;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.6;
+  margin-top: 6px;
+}
+
+/* 左栏里的文件列表自己滚：歌多的时候不会把「应用到全部」顶出屏幕 */
+.sidebar .file-list {
+  flex: 1;
+  min-height: 60px;
+  overflow-y: auto;
+  margin-top: 10px;
+}
+
+.sidebar .list-foot { flex: 0 0 auto; margin-top: 10px; }
+.sidebar .list-foot .btn { flex: 1; justify-content: center; padding: 7px 10px; font-size: 12px; }
+
+/* 左栏窄，拖拽区收成一条，别占掉半屏 */
+.sidebar .dropzone { flex: 0 0 auto; padding: 16px 12px; }
+.sidebar .dropzone .big { font-size: 13px; }
+.sidebar .dropzone .sub { font-size: 11px; margin-top: 4px; line-height: 1.5; }
 
 .card {
   background: var(--panel);
@@ -512,14 +626,18 @@ button.btn {
 button.btn:hover:not(:disabled) { border-color: var(--accent); }
 button.btn:disabled { opacity: .45; cursor: not-allowed; }
 
+/* 主按钮（添加歌曲 / 试听这段 / 生成完整文件 / 生成选中的文件）走双色渐变。
+ * 渐变方向朝右下 = 一点速度感，是这轮「更有活力」的主要落点；
+ * 想退回纯色的话把 background 改成 var(--accent) 就行。 */
 button.btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--grad);
+  border-color: transparent;
   color: var(--accent-ink);
   font-weight: 600;
+  box-shadow: 0 3px 14px -7px rgba(var(--accent-rgb), 1);
 }
 
-button.btn.primary:hover:not(:disabled) { background: #2ee5b5; }
+button.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
 
 button.btn.ghost { background: transparent; }
 
@@ -604,6 +722,15 @@ button.btn.ghost { background: transparent; }
   color: var(--dim);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+/* 渐进切入的时长框：比起止时间框窄，未启用时淡显但仍看得清数字 */
+.fade-sec { width: 62px; }
+.fade-sec:disabled { opacity: .45; }
+
+.clip-fontnote {
+  color: var(--dim);
+  font-size: 12px;
 }
 
 .seek-wrap { margin-top: 4px; }
@@ -866,6 +993,69 @@ button.btn.danger {
 }
 button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6b70; }
 
+/* --------------------------------------------- 左栏里的缓存与数据（窄栏版） */
+
+/* 常驻左栏底部：它管的是磁盘上的临时文件，跟「正在编辑哪首歌」无关。
+   左栏只有 296px，所以这里整体收一档；展开后的清单在栏内自己滚，
+   不会把上面的歌曲库挤出屏幕。 */
+.sidebar .cache-card {
+  flex: 0 0 auto;
+  padding: 12px;
+}
+
+.sidebar .cache-card .side-hint { margin-top: 5px; }
+
+/* 窄栏放不下「按钮 + 说明」并排，改上下两行 */
+.sidebar .cache-card .cache-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin-top: 10px;
+}
+.sidebar .cache-card .cache-row .btn { justify-content: center; padding: 7px 10px; font-size: 12px; }
+.sidebar .cache-card .cache-sum { font-size: 11px; line-height: 1.5; }
+
+/* 滚的是清单本身，不是整个面板 —— 否则底部的「清理选中的」会被卷进去，
+   要滚到最底才点得到 */
+.sidebar .cache-card .cache-panel { margin-top: 10px; max-height: none; }
+.sidebar .cache-card .cache-list { max-height: 190px; overflow-y: auto; }
+
+/* 深色底上系统默认滚动条是浅色的，很扎眼；这里收细压暗 */
+.sidebar .cache-card .cache-list::-webkit-scrollbar { width: 6px; }
+.sidebar .cache-card .cache-list::-webkit-scrollbar-track { background: transparent; }
+.sidebar .cache-card .cache-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .14);
+  border-radius: 3px;
+}
+.sidebar .cache-card .cache-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .26); }
+
+.sidebar .cache-card .cache-item { padding: 9px 10px; gap: 8px; }
+.sidebar .cache-card .cache-item-name { font-size: 12px; }
+.sidebar .cache-card .cache-item-note { font-size: 11px; line-height: 1.5; }
+.sidebar .cache-card .cache-quick { padding: 9px 10px; gap: 9px; font-size: 11px; }
+.sidebar .cache-card button.link { font-size: 11px; }
+
+.sidebar .cache-card .cache-foot {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px;
+}
+.sidebar .cache-card .cache-picked { font-size: 11px; }
+
+/* 「清理选中的 N 个文件」在 296px 里横排会被挤成两行，改竖排整宽 */
+.sidebar .cache-card .cache-foot-btns {
+  flex-direction: column;
+  gap: 6px;
+}
+.sidebar .cache-card .cache-foot-btns .btn {
+  width: 100%;
+  justify-content: center;
+  padding: 7px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 /* ----------------------------------------------------------- 二次确认弹窗 */
 
 .modal {
@@ -1025,6 +1215,30 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 .fr-state.ok { color: var(--accent); }
 .fr-state.bad { color: var(--danger); }
 .fr-state.wait { color: var(--warn); }
+.fr-state.loading { color: var(--accent); }
+
+/* 排队中 / 分析中的行：淡一点、不给手型 —— 它们暂时点不进编辑器 */
+.file-row[data-wait] {
+  cursor: default;
+  opacity: 0.7;
+}
+.file-row[data-wait]:hover { background: none; }
+
+/* 上传进度的小转圈：用在「正在上传并检测节拍…」文案前面 */
+.spin {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -1px;
+  margin-right: 5px;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 
 .list-foot {
   display: flex;
@@ -1061,5 +1275,143 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 @media (max-width: 560px) {
   .fr-state { width: 46px; }
   .fr-bpm { min-width: 62px; }
+}
+
+/* ============================================================
+ * 双栏改版：卡 1 内部的分区与播放条
+ *
+ * 原来「原曲节奏 / 裁剪区间 / 试听」是三张独立的卡，调一次步频要来回滚。
+ * 现在合成一张卡，卡内用一条虚线分区，块与块之间不再各自带边框。
+ * ============================================================ */
+
+/* 卡内分区标题：视觉上隔开，但不用真的拆成两张卡 */
+.subhead {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin: 20px 0 0;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line-soft);
+}
+
+.subhead-label { font-size: 13px; font-weight: 600; }
+
+/* 网格状态原本靠 margin-left:auto 顶到卡的最右边，这里让它跟在标题后面 */
+.subhead .clip-state { margin-left: 0; }
+
+.subhead-tip { flex: 1 1 100%; color: var(--dim); font-size: 11px; }
+
+/* 播放条：按钮 + 进度条并排一行，紧贴波形下方 */
+.player {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.player .seek-wrap {
+  flex: 1;
+  min-width: 220px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 0;
+}
+
+.player .seek-wrap input[type="range"] { flex: 1; }
+
+/* 时间挪到进度条右边，和「试听这段」同一行 */
+.player .seek-meta {
+  display: flex;
+  gap: 6px;
+  margin-top: 0;
+  justify-content: flex-start;
+  white-space: nowrap;
+}
+
+/* 总时长前面补一个斜杠：JS 只管往里写时间，分隔符交给样式，省得动脚本 */
+#seekTotal::before { content: "/ "; color: var(--dim); }
+
+/* 选区那几行的说明文字：跟在控件后面，不单独占一整行 */
+.clip-hint {
+  flex: 1 1 260px;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 卡头右侧的说明，例如「改完直接点上面的试听这段」 */
+.h2-right { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--dim); }
+
+/* 两块波形（主波形 / 选区）紧邻，之间留出一点呼吸 */
+.scope { margin-bottom: 0; }
+
+@media (max-width: 700px) {
+  .topbar .slogan { display: none; }
+  .player .seek-wrap { min-width: 100%; }
+}
+
+/* 波形上方那条细进度条和下方播放条是同一份播放进度，新版只留播放条那一条。
+ * 元素本身留着不动 —— JS 仍在往里写值。 */
+.scope-bar { display: none; }
+
+/* 左栏比原来的卡片窄得多，一行塞不下「名字 + 元信息 + BPM + 状态」，
+ * 硬挤会换行错位。改成两行网格，fr-main 用 display:contents 让它的
+ * 两个子元素直接落进网格，各自占格。 */
+.sidebar .file-row {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "cb name state"
+    "cb meta bpm";
+  align-items: center;
+  gap: 3px 9px;
+  padding: 9px 10px;
+}
+
+.sidebar .file-row > input[type="checkbox"] { grid-area: cb; margin: 0; }
+
+/* 排队中 / 失败的行第一个格子是占位 span，也得占住第一列 */
+.sidebar .file-row > span { grid-column: 1; grid-row: 1 / span 2; }
+
+.sidebar .fr-main { display: contents; }
+.sidebar .fr-name { grid-area: name; }
+
+.sidebar .fr-meta {
+  grid-area: meta;
+  margin-top: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar .fr-bpm {
+  grid-area: bpm;
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.sidebar .fr-bpm span { display: inline; }
+
+.sidebar .fr-state { grid-area: state; width: auto; }
+
+/* 窄屏：左栏收到内容上方，整页恢复滚动 */
+@media (max-width: 1100px) {
+  html, body { height: auto; }
+  .app { height: auto; }
+  .layout { grid-template-columns: 1fr; padding-bottom: 16px; }
+  .sidebar { padding-bottom: 0; }
+  .side-card { max-height: 320px; }
+  /* 缓存卡整宽了，不用再限高，也别在栏内滚 —— 整页本来就能滚，
+     清单一次看全比滚来滚去强 */
+  .sidebar .cache-card,
+  .sidebar .cache-card .cache-panel { max-height: none; }
+  .sidebar .cache-card .cache-list { max-height: none; overflow: visible; }
+  .main { overflow: visible; padding-bottom: 0; }
 }
 
