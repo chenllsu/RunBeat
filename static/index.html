@@ -17,6 +17,16 @@
     <button class="btn primary" id="topAddBtn" type="button">＋ 添加歌曲</button>
   </header>
 
+  <!-- 启动状态条：初始化进度 / 新版本提醒。
+       放在顶栏之下、双栏之上并横跨整页 —— 它讲的是「整个程序」的事，
+       既不属于左栏的工具，也不属于右栏某首歌的编辑。 -->
+  <div class="notice" id="noticeBar" hidden>
+    <span class="notice-dot" id="noticeDot"></span>
+    <span class="notice-text" id="noticeText">—</span>
+    <a class="notice-link" id="noticeLink" href="#" target="_blank" rel="noopener" hidden>查看新版</a>
+    <button class="notice-close" id="noticeClose" type="button" title="关闭提示">×</button>
+  </div>
+
   <div class="layout">
 
     <!-- ============================ 左栏：歌曲库（常驻）

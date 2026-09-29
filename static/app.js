@@ -36,6 +36,16 @@ const state = {
   current: -1,          // 正在编辑的下标；-1 = 还没选中任何一首
 };
 
+/* ---- 启动状态：预热进度 + 新版本 -------------------------------------
+ * 打包版首次运行要现场编译 numba（约 1~2 分钟），这期间上传的第一首歌会等很久。
+ * 不提前说清楚，用户只会以为程序卡死了。状态由后端 /api/health 一并给出。 */
+const startup = {
+  warmupChecked: false,   // 是否已经问过至少一次
+  warmupReady: false,     // 音频引擎是否编译完成
+  update: { current: null, latest: null, has_update: false, url: null },
+  noticeClosed: false,    // 用户手动关掉了提示条
+};
+
 const liveAudio = $('liveAudio');
 const metroAudio = $('metroAudio');
 let activeMode = null;      // 'live' | 'metro' | null
@@ -1090,6 +1100,14 @@ async function handleFiles(fileList) {
   renderFileList();
 }
 
+/* 音频引擎还没编译完时，把「为什么慢」说明白 ——
+ * 这是打包版新用户几乎一定会撞上的一步，不解释就会被当成卡死。 */
+function slowHint(fallback) {
+  return startup.warmupReady
+    ? fallback
+    : '首次运行要先编译音频引擎，约 1~2 分钟；之后就快了（每首约 1 秒）';
+}
+
 /* 上传区的忙碌提示。逐首上传时带上「第几首 / 共几首」和歌名 ——
  * 批量时用户最想知道的就是进度到哪儿了。 */
 function setDropzoneBusy(done, total, name) {
@@ -1098,12 +1116,12 @@ function setDropzoneBusy(done, total, name) {
   if (!big || !sub) return;
   if (done > 0 && total > 1) {
     big.textContent = `正在处理 ${done} / ${total} 首…`;
-    sub.textContent = `当前：${name}`;
+    sub.textContent = slowHint(`当前：${name}`);
     return;
   }
   if (done > 0) {
     big.textContent = '正在上传并分析节拍…';
-    sub.textContent = '检测完就出结果，请稍等';
+    sub.textContent = slowHint('检测完就出结果，请稍等');
     return;
   }
   big.textContent = '把音频文件拖到这里';
@@ -2708,16 +2726,72 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('cacheModal').hidden) closeCacheModal();
 });
 
-/* ------------------------------------------------------------ 启动自检 */
+/* --------------------------------------------- 启动状态条与健康自检 */
 
-fetch('/api/health')
-  .then((r) => r.json())
-  .then((d) => {
-    if (d.output !== '.mp3') {
+function setNotice(kind, text, url, closable) {
+  const bar = $('noticeBar');
+  bar.hidden = false;
+  bar.classList.toggle('update', kind === 'update');
+  $('noticeText').textContent = text;
+  const link = $('noticeLink');
+  if (url) {
+    link.href = url;
+    link.hidden = false;
+  } else {
+    link.hidden = true;
+  }
+  $('noticeClose').hidden = !closable;
+}
+
+/* 三态互斥：初始化中 → 有新版本 → 不显示。 */
+function renderNotice() {
+  const bar = $('noticeBar');
+  if (startup.noticeClosed) {
+    bar.hidden = true;
+    return;
+  }
+  if (startup.warmupChecked && !startup.warmupReady) {
+    setNotice('info', '正在初始化音频引擎（首次运行约需 1~2 分钟），稍候再上传歌曲', null, false);
+    return;
+  }
+  if (startup.update.has_update && startup.update.latest) {
+    const now = startup.update.current ? `（当前 v${startup.update.current}）` : '';
+    setNotice('update', `有新版本 v${startup.update.latest} 可用${now}`, startup.update.url, true);
+    return;
+  }
+  bar.hidden = true;
+}
+
+/* 查一次启动状态；预热还没完成就继续轮询，完成即止 —— 不做常驻轮询。 */
+async function pollStartup() {
+  try {
+    const resp = await fetch('/api/health');
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    const first = !startup.warmupChecked;
+    startup.warmupChecked = true;
+    startup.warmupReady = !!(data.warmup && data.warmup.ready);
+    if (data.update) startup.update = data.update;
+
+    renderNotice();
+
+    // 下面这条只报一次，否则轮询期间会反复弹同一个提示
+    if (first && data.output !== '.mp3') {
       toast('当前 ffmpeg 没有 mp3 编码器，文件将以 m4a 输出', 'info');
     }
-  })
-  .catch(() => { /* 忽略 */ });
+    if (!startup.warmupReady) setTimeout(pollStartup, 3000);
+  } catch (err) {
+    /* 后端没起来 / 请求被中断：不弹错、不重试，静默即可 */
+  }
+}
+
+$('noticeClose').addEventListener('click', () => {
+  startup.noticeClosed = true;
+  renderNotice();
+});
+
+pollStartup();
 
 // 顺带把 data/ 的占用拉回来，「缓存与数据」的标题栏一进页面就有数字
 loadStorage();
@@ -2729,6 +2803,7 @@ syncFadeUI();
    便于本地预览、截图与排查问题（不影响正常使用）。 */
 window.__runbeat = {
   state,
+  startup,
   WAVE,
   beatInfo,
   computePlan,

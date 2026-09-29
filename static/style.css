@@ -102,6 +102,69 @@ html, body { height: 100%; }
 
 .tb-spacer { flex: 1; }
 
+/* 启动状态条：初始化进度 / 新版本提醒。
+ * 整页高度是锁死的（.app 是 100vh 的纵向 flex），所以它不能靠 margin 撑开，
+ * 用 flex:0 0 auto 占住自己那一行，剩余空间照旧留给 .layout。 */
+.notice {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 20px;
+  font-size: 13px;
+  color: var(--text);
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(34, 211, 166, .09);
+}
+
+.notice-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: notice-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes notice-pulse {
+  0%, 100% { opacity: 1;  transform: scale(1); }
+  50%      { opacity: .3; transform: scale(.75); }
+}
+
+.notice-text { flex: 1 1 auto; }
+
+.notice-link {
+  flex: 0 0 auto;
+  color: var(--accent-2);
+  text-decoration: none;
+  border-bottom: 1px dashed currentColor;
+}
+
+.notice-link:hover { color: var(--accent); }
+
+.notice-close {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notice-close:hover { color: var(--text); }
+
+/* 新版本用琥珀色：和「正在初始化」区分开，一眼看出是两类事 */
+.notice.update {
+  background: rgba(240, 180, 41, .10);
+}
+
+.notice.update .notice-dot {
+  background: #f0b429;
+  animation: none;
+}
+
 .layout {
   flex: 1;
   min-height: 0;
