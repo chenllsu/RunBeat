@@ -2,11 +2,57 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+
+def _is_frozen() -> bool:
+    """是否跑在 PyInstaller 打出来的包里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _resource_dir() -> Path:
+    """只读资源（``static/``）所在目录。
+
+    打包后 PyInstaller 会把 datas 解到 ``sys._MEIPASS``（onedir 形态下就是
+    ``_internal``），开发时就是源码目录。
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else Path(__file__).resolve().parent.parent
+
+
+def _writable(path: Path) -> bool:
+    """新建目录并判断能否写入。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(path, os.W_OK)
+
+
+def _data_dir() -> Path:
+    """运行时数据目录（上传件 / 分析缓存 / 预览 / 成品）。
+
+    打包后**绝不能**落在 ``sys._MEIPASS`` 里：那是每次启动临时解压出来的目录，
+    写进去的东西用户下次就找不到了（onefile 形态更是退出即删）。
+    优先用 exe 同级的 ``data/``（绿色便携，用户一眼能看到自己的文件）；
+    装在 Program Files 这类只读位置时退到 ``%LOCALAPPDATA%\\RunBeat``。
+    """
+    if not _is_frozen():
+        return Path(__file__).resolve().parent.parent / "data"
+
+    exe_dir = Path(sys.executable).resolve().parent
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "RunBeat" / "data"
+    for candidate in (exe_dir / "data", local):
+        if _writable(candidate):
+            return candidate
+    return exe_dir / "data"  # 都不行就先用 exe 同级，让后面的报错说话
+
+
+BASE_DIR = _resource_dir()
 STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = _data_dir()
 
 UPLOAD_DIR = DATA_DIR / "uploads"      # 用户上传的原始文件
 ANALYSIS_DIR = DATA_DIR / "analysis"   # 转成单声道 wav，仅供 BPM 检测
