@@ -21,11 +21,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import audio, config, store
+from . import __version__, audio, config, store, update
+
+# 预热进度。打包版首次运行要现场编译 numba，可能要一两分钟；
+# 记下状态，前端才能在等待期间说清「为什么慢」。
+_warmup_state: dict = {"ready": False, "seconds": None}
 
 
 def _warmup() -> None:
     """后台预热：解析 ffmpeg 路径、探测编码器、预载 librosa 并触发 numba 编译。"""
+    started = time.time()
     try:
         audio.ffmpeg()
         audio.output_settings()
@@ -35,6 +40,8 @@ def _warmup() -> None:
         audio.warmup()
     except Exception:
         pass
+    _warmup_state["ready"] = True
+    _warmup_state["seconds"] = round(time.time() - started, 1)
 
 
 def _cleanup_loop() -> None:
@@ -50,10 +57,13 @@ def _cleanup_loop() -> None:
 async def lifespan(_app: FastAPI):
     threading.Thread(target=_warmup, daemon=True).start()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
+    update.check_async()          # 查最新版本；失败静默，不影响启动
     yield
 
 
-app = FastAPI(title="RunBeat", version="0.5.0", lifespan=lifespan)
+# 版本号只此一处来源（app/__init__.py）。以前这里硬编码，和 __init__ 各改各的，
+# 结果发出去的包与 tag 对不上（包内 0.4.0 / tag v0.5.0）。
+app = FastAPI(title="RunBeat", version=__version__, lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------
@@ -227,9 +237,13 @@ async def _beats_for_async(record: dict, bpm: float) -> dict:
 async def health() -> dict:
     return {
         "ok": True,
+        "version": __version__,
         "ffmpeg": audio.ffmpeg(),
         "output": audio.output_settings()[1],
         "store": store.stats(),
+        # 前端靠这两项决定要不要提示「首次运行较慢」与「有新版本」
+        "warmup": dict(_warmup_state),
+        "update": update.state(),
     }
 
 

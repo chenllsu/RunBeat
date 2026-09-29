@@ -27,6 +27,12 @@ a = Analysis(
         "uvicorn.lifespan",
         "uvicorn.lifespan.on",
         "h11",
+        # 原生窗口。runbeat_desktop 里是在函数内 import 的，显式列出来更稳当；
+        # hooks-contrib 的 hook-webview / hook-clr / hook-clr_loader 会把
+        # WebView2 的那几个 DLL 和 Python.Runtime.dll 一并收进来。
+        "webview",
+        "webview.platforms.winforms",
+        "clr",
     ],
     hookspath=[],
     hooksconfig={},
@@ -56,9 +62,9 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    # 保留控制台窗口：它同时是"运行状态指示"和"退出按钮"（关窗即退出）。
-    # 想要无窗口形态，改成 False 并加桌面窗口外壳。
-    console=True,
+    # 有原生窗口了，不再需要那个黑色控制台 —— 用户看到的就是一个正常应用窗口。
+    # 出错时启动器会弹系统消息框并指出日志位置（见 runbeat_desktop._alert）。
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
