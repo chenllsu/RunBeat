@@ -12,3 +12,7 @@ soundfile>=0.12
 
 # 自带 ffmpeg 二进制，无需手动安装 ffmpeg
 imageio-ffmpeg>=0.5
+
+# 桌面版窗口外壳（runbeat_desktop.py 用）。
+# 只跑 uvicorn 的纯网页模式其实用不到，但打成 exe 必须带上，所以列进依赖。
+pywebview>=5.0

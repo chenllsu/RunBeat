@@ -1,0 +1,72 @@
+name: 打包并发布 Windows 桌面版
+
+# 打个 tag（如 v0.6.0）就自动在 GitHub 的机器上打包、压缩、挂到 Release 附件。
+# 从此不需要在本地打包再从国内往上传 130MB。
+# 也可以在 Actions 页面手动触发，那种情况下只产出构建产物，不碰 Release。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 挂 Release 附件需要写权限
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: x64
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller==6.22.2"
+
+      # 本地手工发版时踩过一次：tag 是 v0.5.0，包里的版本号却还是 0.4.0。
+      # 与其发出去再发现，不如在这里直接卡住。
+      - name: 校验 tag 与代码里的版本号一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = (python -c "import app; print(app.__version__)").Trim()
+          Write-Host "tag = $tag / 代码 = $ver"
+          if ($tag -ne $ver) {
+            Write-Error "tag（$tag）与 app/__init__.py 的版本号（$ver）不一致：请先改版本号提交，再重新打 tag"
+          }
+
+      - name: PyInstaller 打包
+        run: python -m PyInstaller --clean --noconfirm RunBeat.spec
+
+      - name: 压缩成单个 zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/RunBeat/* -DestinationPath dist/RunBeat-win64.zip -Force
+          $zip = Get-Item dist/RunBeat-win64.zip
+          Write-Host ("zip 大小：{0:N1} MB" -f ($zip.Length / 1MB))
+
+      - name: 留存构建产物（手动触发时也能下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: RunBeat-win64
+          path: dist/RunBeat-win64.zip
+          retention-days: 30
+
+      - name: 挂到 Release 附件
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RunBeat-win64.zip
+          generate_release_notes: true
+          body: |
+            下载 `RunBeat-win64.zip`，**解压后**双击 `RunBeat.exe` 即可使用（无需安装 Python）。
+
+            第一次分析一首歌需要等 1~2 分钟（程序在编译音频引擎），之后每首只要 1 秒左右。
