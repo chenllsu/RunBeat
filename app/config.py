@@ -89,7 +89,7 @@ NATURAL_YELLOW = 0.25                   # ±25% 内：勉强
 PREVIEW_LENGTH_SEC = 20.0               # 精确试听片段长度
 SPM_MIN = 120                           # 目标步频可调范围
 SPM_MAX = 220
-SPM_DEFAULT = 170
+SPM_DEFAULT = 175
 
 # ---------------------------------------------------------------- 其他
 ANALYSIS_SR = 22050                     # BPM 检测用的采样率

@@ -38,6 +38,9 @@
         <div class="big">把音频文件拖到这里</div>
         <div class="sub">可以一次选多个 · mp3 / wav / m4a / flac · 每个最大 20 MB、10 分钟</div>
       </div>
+      <div class="first-hint" id="firstHint">
+        第一次用？三步：<b>选一首歌</b> → 它自动测出原曲节奏 → <b>设你的步频</b>生成匹配的音乐 → 导出放进跑步播放器。
+      </div>
       <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" multiple hidden>
 
       <section class="side-card" id="listCard" hidden>
@@ -75,7 +78,10 @@
           <span class="cache-sum" id="cacheSum">—</span>
         </div>
 
+        <!-- 内层是给展开/收起动画用的：外层用 grid-template-rows 0fr↔1fr 做高度动画，
+             必须有一个可裁剪的子元素，否则收起时内容会照常溢出。 -->
         <div class="cache-panel" id="cachePanel" hidden>
+          <div class="cpanel-inner">
           <div class="cache-list" id="cacheList"></div>
 
           <div class="cache-quick">
@@ -92,6 +98,7 @@
               <button class="btn danger" id="cacheClearBtn" type="button">清理选中的</button>
             </span>
           </div>
+          </div>
         </div>
       </section>
 
@@ -102,11 +109,11 @@
 
       <div id="panel" hidden>
 
-        <!-- ====================== 1 原曲节奏与选区
-             把「看波形 → 调倍率 → 试听」这一串收在一张卡里，避免来回滚动。
-             卡内顺序：曲目信息 → 检测结果 → 主波形 → 选区波形 → 播放条 → 选区数值。 -->
+        <!-- ====================== 1 原曲节奏
+             只管「这首歌本身有多快」：曲目信息 → 检测结果 → 候选拍点 → 主波形。
+             裁剪与步频是两种不同的改动，各占一张卡（见下面 2 / 3）。 -->
         <section class="card">
-          <h2><span class="idx">1</span>原曲节奏与选区
+          <h2><span class="idx">1</span>原曲节奏
             <span class="live-dot" id="beatDot" hidden><i></i>正在播放</span>
           </h2>
 
@@ -163,35 +170,31 @@
             </div>
           </div>
 
+          <!-- 播放条（试听成品 / 停止 / 进度条）已搬到窗口底部常驻：#playerBar。
+               它跟着「正在听什么」走，不属于任何一张卡，所以放在 .app 的最后一层，
+               滚到哪一栏都能直接拖进度。 -->
+
           <!-- 选区：拖动波形上的两个手柄选一段 -->
           <div class="subhead">
             <span class="subhead-label">裁剪区间</span>
             <span class="clip-state" id="clipState">整首</span>
-            <span class="subhead-tip">拖动波形上的手柄选一段，试听和生成的都只有这一段；不选就是整首</span>
+            <span class="subhead-tip">具体怎么裁见下方第 2 步</span>
           </div>
+
+          <div class="verdict" id="verdict">—</div>
+        </section>
+
+        <!-- ====================== 2 裁剪
+             只管「留哪一段」：选区波形 → 起止数值 → 淡入 → 试听裁剪。
+             与步频无关，所以单独成卡；「试听裁剪」是原速的，不含任何变速。 -->
+        <section class="card">
+          <h2><span class="idx">2</span>裁剪
+            <span class="h2-right">原速试听这一段，不含变速</span>
+          </h2>
 
           <div class="clip-canvas">
             <canvas id="clipCanvas"></canvas>
             <div class="clip-empty" id="clipEmpty">正在读取波形…</div>
-          </div>
-
-          <!-- 播放条：紧贴波形下方 -->
-          <div class="player">
-            <button class="btn primary" id="clipPreviewBtn" type="button">
-              <span class="btn-label">试听这段</span>
-            </button>
-            <button class="btn ghost" id="playLiveBtn" type="button">
-              <span class="btn-label">试听</span>
-            </button>
-            <button class="btn ghost" id="stopBtn" type="button">停止</button>
-
-            <div class="seek-wrap">
-              <input type="range" id="seek" min="0" max="1000" step="1" value="0">
-              <div class="seek-meta">
-                <span id="seekTime">00:00</span>
-                <span id="seekTotal">00:00</span>
-              </div>
-            </div>
           </div>
 
           <div class="clip-row">
@@ -214,7 +217,10 @@
             <span class="clip-fontnote">裁剪后第一声太突然时打开；试听和生成的成品都会生效</span>
           </div>
 
-          <div class="clip-row">
+          <div class="player">
+            <button class="btn primary" id="clipPreviewBtn" type="button" title="原速播放选中的片段，只听裁剪和渐入效果">
+              <span class="btn-label">试听裁剪</span>
+            </button>
             <button class="btn ghost" id="metroBtn" type="button">
               <span class="btn-label">听节拍对齐</span>
             </button>
@@ -222,22 +228,20 @@
               松手时起止点会对准最近的鼓点（最多挪半拍）。改起点就从新起点开始听，改终点自动跳到终点前 5 秒，专门听收尾接得顺不顺。
             </span>
           </div>
-
-          <div class="verdict" id="verdict">—</div>
         </section>
 
-        <!-- ====================== 2 目标步频 -->
+        <!-- ====================== 3 目标步频 -->
         <section class="card">
-          <h2><span class="idx">2</span>目标步频
-            <span class="h2-right">改完直接点上面的「试听这段」</span>
+          <h2><span class="idx">3</span>目标步频
+            <span class="h2-right">改完点「试听变速」当场听；进度条在卡 1，拖动可定位到想听的段落</span>
           </h2>
 
           <div class="control">
             <div class="control-head">
               <span class="label">每分钟步数</span>
-              <span class="value"><span id="spmValue">170</span> spm</span>
+              <span class="value"><span id="spmValue">175</span> spm</span>
             </div>
-            <input type="range" id="spmRange" min="120" max="220" step="1" value="170">
+            <input type="range" id="spmRange" min="120" max="220" step="1" value="175">
           </div>
 
           <div class="control">
@@ -266,24 +270,18 @@
             <div class="line1">
               <span id="ratioText">×1.000</span>
               <span class="badge green" id="naturalBadge">舒适</span>
+              <button class="btn primary" id="speedPreviewBtn" type="button" title="从进度条当前位置播放：裁剪 + 变速的效果；勾了「试听时叠加节拍声」就一起叠上">
+                <span class="btn-label">试听变速</span>
+              </button>
             </div>
             <div class="line2" id="statusDetail">—</div>
           </div>
-        </section>
 
-        <!-- ====================== 3 试听设置与生成下载 -->
-        <section class="card">
-          <h2><span class="idx">3</span>试听设置与生成下载</h2>
-
-          <label class="checkline" style="margin-top:0">
-            <input type="checkbox" id="keepPitch" checked>
-            试听时保持音高（更接近成品，但浏览器算法音质略糙）
-          </label>
-
-          <label class="checkline">
+          <label class="checkline checkline-after-status">
             <input type="checkbox" id="previewMetro">
-            <strong>试听时</strong>叠加节拍声（拖动步频时跟着一起变，用来确认节拍踩得准不准）
+            <strong>试听时</strong>叠加节拍声（「试听变速」和卡 1 的「试听成品」都会带上拍点）
           </label>
+          <div class="hint" id="btLatencyHint" hidden>蓝牙耳机自带 0.1~0.3 秒延迟，节拍声会听起来「慢半拍」；判断踩点准不准请用有线耳机或外放。</div>
 
           <div class="metro-vol" id="metroVolRow" hidden>
             <span class="vol-label">节拍声大小</span>
@@ -296,8 +294,13 @@
             <span class="beat-pulse" id="beatPulse" hidden title="每响一下节拍声，这里就闪一下"></span>
             <span class="meta" id="nowPlayingInfo"></span>
           </div>
+        </section>
 
-          <label class="checkline">
+        <!-- ====================== 4 导出 -->
+        <section class="card">
+          <h2><span class="idx">4</span>导出</h2>
+
+          <label class="checkline" style="margin-top:0">
             <input type="checkbox" id="exportMetro">
             <strong>导出时</strong>叠加节拍声（<strong>只影响下载的文件，试听不受影响</strong>）
           </label>
@@ -314,11 +317,11 @@
 
       </div>
 
-      <!-- ====================== 4 批量导出
+      <!-- ====================== 5 批量导出
            只对「勾选的文件」生效：先逐首生成（后端完整渲染），再一起下载。
            放在 #panel 外面，因为它是「对整批操作」，不属于任何单独一首。 -->
       <section class="card" id="batchCard" hidden>
-        <h2><span class="idx">4</span>批量导出
+        <h2><span class="idx">5</span>批量导出
           <span class="batch-sum" id="batchSum">—</span>
         </h2>
         <div class="hint" style="margin-top:0">
@@ -352,6 +355,36 @@
       </footer>
 
     </main>
+  </div>
+
+  <!-- 底部悬浮试听栏：限宽居中、圆角浮层，悬在两栏之上（不是贯穿整个窗口的横条）。
+       滚到任何一栏都能直接拖进度；两栏底部已留出让位空间，不会压住内容。 -->
+  <div class="playbar" id="playerBar" hidden>
+    <!-- 播放键是「播放/暂停」合一：正在放显示暂停图标（再点即暂停，从暂停处接着放），
+         其余情况显示播放图标。图标用 currentColor 上色，配色交给 CSS。 -->
+    <button class="pb-btn pb-play" id="playLiveBtn" type="button" aria-label="试听成品"
+            title="从进度条位置播放：裁剪 + 变速 + 节拍声（节拍声按第 3 步开关）">
+      <svg class="pb-ico pb-ico-play" viewBox="0 0 14 16" aria-hidden="true"><path d="M2.6 1.5 L12.4 8 L2.6 14.5 Z"/></svg>
+      <svg class="pb-ico pb-ico-pause" viewBox="0 0 14 16" aria-hidden="true"><rect x="2.8" y="2" width="3.3" height="12" rx="1.3"/><rect x="7.9" y="2" width="3.3" height="12" rx="1.3"/></svg>
+    </button>
+    <button class="pb-btn pb-stop" id="stopBtn" type="button" aria-label="停止播放" title="停止播放">
+      <svg class="pb-ico" viewBox="0 0 14 14" aria-hidden="true"><rect x="3.2" y="3.2" width="7.6" height="7.6" rx="1.7"/></svg>
+    </button>
+
+    <!-- 进度条是「自绘视觉层 + 透明原生 range 覆盖」：拖动与键盘仍交给原生 range，
+         外观全归 .seek-line 里的三个 span（轨道 / 已播 / 滑块），JS 逻辑一行没改。 -->
+    <div class="seek-wrap">
+      <span class="seek-time" id="seekTime">00:00</span>
+      <div class="seek-track" id="seekTrack">
+        <div class="seek-line">
+          <span class="seek-rail"></span>
+          <span class="seek-fill"></span>
+          <span class="seek-knob"></span>
+        </div>
+        <input type="range" id="seek" min="0" max="1000" step="1" value="0" aria-label="播放进度">
+      </div>
+      <span class="seek-time is-dim" id="seekTotal">00:00</span>
+    </div>
   </div>
 
   <!-- 清缓存的二次确认。删除不可恢复，所以是个真正的模态：遮住背景，只能选确认或取消 -->
