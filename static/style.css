@@ -21,6 +21,23 @@
   --danger: #f2555a;
   --radius: 14px;
   --radius-sm: 9px;
+  /* 底部悬浮试听栏占掉的高度（栏本身约 64px + 离底 18px + 一点余量）。
+     左栏和右栏都用它做 padding-bottom，改悬浮条尺寸时只动这里。 */
+  --playbar-space: 106px;
+
+  /* ---- 动效时长四档 ----
+     档位越少越好记：微反馈（hover/颜色）、控件（开关/图标）、入场（卡片/弹层/新行）、
+     让位（面板展开收起）。新动画一律从这四档里挑，别自己拍一个数字。 */
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --dur-3: 240ms;
+  --dur-4: 280ms;
+  /* 退场永远比入场快：东西收走时没人愿意等 */
+  --dur-out: 170ms;
+  /* 通用缓动：快起慢收 */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  /* 带一点过冲的「弹性」缓动，只用在位移/缩放上 —— 透明度别用它（会先冲到 1 再回落） */
+  --ease-spring: cubic-bezier(.34, 1.42, .64, 1);
 }
 
 * { box-sizing: border-box; }
@@ -179,14 +196,47 @@ html, body { height: 100%; }
   flex-direction: column;
   gap: 12px;
   min-height: 0;
-  padding-bottom: 16px;
+  /* 底部给悬浮试听栏让位，否则「缓存与数据」卡的下半截会被它压住 */
+  padding-bottom: var(--playbar-space);
 }
 
 /* 右栏自己滚（整页高度锁死），左栏和顶栏不跟着动 */
 .main {
   min-width: 0;
   overflow-y: auto;
-  padding-bottom: 40px;
+  /* 同上：滚到底时最后一张卡要能整个露在悬浮条上面 */
+  padding-bottom: var(--playbar-space);
+}
+
+/* 深色底上系统默认滚动条是浅色带箭头的一整条，跟这个界面完全不是一路；
+ * 统一收成细条压暗：thumb 用半透明白，靠 border + background-clip 把视觉
+ * 压到 6px（热区仍留 10px 好抓）。左栏缓存清单另有 6px 版本，见下面对应规则。 */
+.main::-webkit-scrollbar,
+.sidebar .file-list::-webkit-scrollbar,
+html::-webkit-scrollbar,
+body::-webkit-scrollbar { width: 10px; height: 10px; }
+
+.main::-webkit-scrollbar-track,
+.sidebar .file-list::-webkit-scrollbar-track,
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track { background: transparent; }
+
+.main::-webkit-scrollbar-thumb,
+.sidebar .file-list::-webkit-scrollbar-thumb,
+html::-webkit-scrollbar-thumb,
+body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .1);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
+
+.main::-webkit-scrollbar-thumb:hover,
+.sidebar .file-list::-webkit-scrollbar-thumb:hover,
+html::-webkit-scrollbar-thumb:hover,
+body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .24);
+  background-clip: padding-box;
 }
 
 /* ----------------------------------------------------------- 左栏歌曲库 */
@@ -277,7 +327,7 @@ html, body { height: 100%; }
   padding: 40px 20px;
   text-align: center;
   cursor: pointer;
-  transition: border-color .15s, background .15s;
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
 }
 
 .dropzone:hover { border-color: var(--accent); background: #0f1720; }
@@ -346,7 +396,7 @@ input[type="number"]:focus, input[type="text"]:focus {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  transition: border-color .15s, color .15s, background .15s;
+  transition: border-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
 }
 
 .chip b { font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -405,7 +455,7 @@ input[type="number"]:focus, input[type="text"]:focus {
   height: 4px;
   border-radius: 2px;
   background: var(--line);
-  transition: background .2s;
+  transition: background var(--dur-2) var(--ease);
 }
 
 .conf-bars.lv1 i:nth-child(1) { background: var(--danger); }
@@ -661,6 +711,9 @@ input[type="range"]::-moz-range-thumb {
 .status .line2 { color: var(--muted); font-size: 13px; margin-top: 8px; }
 .status .line2 b { color: var(--text); font-weight: 600; }
 
+/* 状态行右边的试听按钮：顶到最右，和倍率数字拉开距离 */
+.status .line1 #speedPreviewBtn { margin-left: auto; }
+
 /* ----------------------------------------------------------- 播放 */
 
 .player {
@@ -683,7 +736,7 @@ button.btn {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  transition: border-color .15s, background .15s;
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
 }
 
 button.btn:hover:not(:disabled) { border-color: var(--accent); }
@@ -822,6 +875,11 @@ button.btn.ghost { background: transparent; }
 
 .checkline input { accent-color: var(--accent); width: 15px; height: 15px; }
 
+/* 「试听时叠加节拍声」紧跟在卡 3 的状态面板（.status）之后。
+ * 它原本带内联 margin-top:0 —— 那是它还当卡片首元素时的遗留，上面换成带边框的面板后
+ * 就成了零间距、勾选框贴着面板底边。这里 16px：比 .hint(10px) 松、比 .control(18px) 紧。 */
+.checkline-after-status { margin-top: 16px; }
+
 /* 节拍声音量：试听与导出共用同一个值，所以只放这一个滑块 */
 .metro-vol {
   display: flex;
@@ -861,6 +919,8 @@ button.btn.ghost { background: transparent; }
 .now-playing .tag { color: var(--muted); font-size: 12px; }
 .now-playing .tag.live { color: var(--accent); }
 .now-playing .tag.metro { color: var(--warn); }
+.now-playing .tag.clip { color: var(--dim); }
+.now-playing .tag.speed { color: var(--accent-deep); }
 
 /* 节拍声指示：每响一下闪一次。听不清到底是没响还是被音乐盖住时，
  * 看它闪不闪就能立刻分辨。margin-right:auto 把它顶到标签右边、
@@ -906,11 +966,42 @@ button.btn.ghost { background: transparent; }
 .result .row b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .result audio { width: 100%; margin-top: 12px; }
 
+/* 批量结果行内的「试听成品」小圆钮（单首导出的 <audio> 太重，一行一个够了） */
+.mini-play {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-left: 8px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+.mini-play:hover { background: rgba(var(--accent-rgb), .12); border-color: var(--accent); }
+
+/* 空状态首次引导：一句话说清这个工具是干嘛的，有歌了就藏 */
+.first-hint {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm, 8px);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 /* ----------------------------------------------------------- 提示 */
 
 .toast {
   position: sticky;
-  bottom: 20px;
+  /* sticky 的包含块是 .main 的内容盒，其底边已被 padding-bottom 让过悬浮栏
+     （--playbar-space），这里再设 bottom 就等于把让位扣两次 → toast 悬到屏幕中间。
+     所以这里必须是 0：贴着内容盒底边 = 刚好落在悬浮栏上方。 */
+  bottom: 0;
   margin-top: 16px;
   padding: 12px 16px;
   border-radius: var(--radius-sm);
@@ -1325,7 +1416,7 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   height: 100%;
   width: 0;
   background: var(--accent);
-  transition: width .2s ease;
+  transition: width var(--dur-2) var(--ease);
 }
 
 .bp-text {
@@ -1395,8 +1486,149 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   white-space: nowrap;
 }
 
-/* 总时长前面补一个斜杠：JS 只管往里写时间，分隔符交给样式，省得动脚本 */
-#seekTotal::before { content: "/ "; color: var(--dim); }
+/* 底部常驻播放条：进度条跟着「正在听什么」走，不属于任何一张卡，所以从卡 1
+ * 改成悬浮胶囊（10-08）：限宽居中、圆角、四周留白，浮在两栏之上。
+ * 原来那条贯穿整个窗口的直角横条虽然也不遮内容，但它跟上面整套圆角卡片不是
+ * 一个语言（一条横杠从最左拉到最右，像浏览器自带的工具栏）。现在悬在底部中央，
+ * 两栏底部各留出让位空间（见 .main / .sidebar 的 padding-bottom）。 */
+.playbar {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 40;
+  width: min(880px, calc(100vw - 40px));
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 11px 18px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel-2);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55), 0 2px 6px rgba(0, 0, 0, .35);
+}
+
+/* 圆形按键。播放键走主渐变（一眼看出是主操作），停止键是描边次级按钮。
+ * 两个都只剩图标，语义交给 title / aria-label。 */
+.pb-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: transform var(--dur-1) var(--ease), filter var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.pb-btn:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.pb-btn:active { transform: scale(.93); }
+
+.pb-play {
+  width: 40px;
+  height: 40px;
+  background: var(--grad);
+  color: var(--accent-ink);
+  box-shadow: 0 2px 10px rgba(var(--accent-rgb), .22);
+}
+
+.pb-play:hover { filter: brightness(1.07); }
+
+.pb-stop {
+  width: 36px;
+  height: 36px;
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.pb-stop:hover { border-color: var(--muted); color: var(--text); }
+
+.pb-ico { width: 15px; height: 15px; fill: currentColor; }
+
+/* 三角形重心偏左，往右挪 2px 才是视觉居中 */
+.pb-ico-play { margin-left: 2px; }
+.pb-ico-pause { display: none; }
+.pb-play.is-playing .pb-ico-play { display: none; }
+.pb-play.is-playing .pb-ico-pause { display: block; }
+
+/* 进度条：自绘视觉层 + 透明原生 range 盖在上面。
+ * 原生 range 的长相被浏览器钉死（直角轨道 + 固定形状的 thumb），在深色底上
+ * 怎么调都生硬，所以外观整个交给三个 span，range 只保留「可拖、可聚焦」。
+ * 已播宽度和滑块位置读的是同一个 --fill 百分比，JS 那边只有一个写入点。 */
+.playbar .seek-wrap {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 0;             /* 盖掉通用的 .seek-wrap 上边距 */
+}
+
+.seek-track {
+  position: relative;
+  flex: 1;
+  min-width: 90px;
+  height: 26px;              /* 触控高度给足，鼠标和手指都好点中 */
+}
+
+/* 左右各让出 7px（滑块半径），这样 --fill 为 0% / 100% 时滑块都不越界 */
+.seek-line { position: relative; height: 100%; margin: 0 7px; }
+
+.seek-rail,
+.seek-fill {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 10px;
+  border-radius: 5px;
+  transform: translateY(-50%);
+}
+
+.seek-rail { width: 100%; background: var(--line); }
+
+.seek-fill { width: var(--fill, 0%); background: var(--grad); }
+
+.seek-knob {
+  position: absolute;
+  top: 50%;
+  left: var(--fill, 0%);
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: var(--text);
+  border: 3px solid var(--accent-deep);
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .5);
+  pointer-events: none;      /* 拖动让给下面那层透明 range */
+  transition: transform var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+
+.seek-track:hover .seek-knob,
+.seek-track:focus-within .seek-knob { transform: scale(1.15); border-color: var(--accent-2); }
+
+.playbar .seek-track #seek {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;                /* 只负责拖动与键盘，视觉一概不参与 */
+  cursor: pointer;
+  z-index: 2;
+}
+
+.seek-time {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.seek-time.is-dim { color: var(--dim); }
 
 /* 选区那几行的说明文字：跟在控件后面，不单独占一整行 */
 .clip-hint {
@@ -1414,7 +1646,8 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 @media (max-width: 700px) {
   .topbar .slogan { display: none; }
-  .player .seek-wrap { min-width: 100%; }
+  .player .seek-wrap,
+  .playbar .seek-wrap { min-width: 100%; }
 }
 
 /* 波形上方那条细进度条和下方播放条是同一份播放进度，新版只留播放条那一条。
@@ -1467,7 +1700,8 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 @media (max-width: 1100px) {
   html, body { height: auto; }
   .app { height: auto; }
-  .layout { grid-template-columns: 1fr; padding-bottom: 16px; }
+  /* 单栏时整页滚动，底部同样要给悬浮条留位（它是 fixed，会盖住页面尾部） */
+  .layout { grid-template-columns: 1fr; padding-bottom: var(--playbar-space); }
   .sidebar { padding-bottom: 0; }
   .side-card { max-height: 320px; }
   /* 缓存卡整宽了，不用再限高，也别在栏内滚 —— 整页本来就能滚，
@@ -1476,5 +1710,98 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   .sidebar .cache-card .cache-panel { max-height: none; }
   .sidebar .cache-card .cache-list { max-height: none; overflow: visible; }
   .main { overflow: visible; padding-bottom: 0; }
+}
+
+/* 触屏设备：滑块的默认命中区太小，手指很难精确拖住。
+ * 拉高整条轨道的触控高度，拇指不容易滑脱；不动桌面端。 */
+@media (pointer: coarse) {
+  input[type="range"] { min-height: 30px; }
+  input[type="range"]::-webkit-slider-thumb { transform: scale(1.15); }
+}
+
+/* ============================================================ 动效
+ *
+ * 三条规矩（别破例）：
+ * 1. 只动 transform / opacity —— 这两个走合成层不掉帧。高度动画只有缓存面板一处，
+ *    用 grid-template-rows 0fr↔1fr（不用 max-height 猜一个值），代价是每帧重排，
+ *    所以只准用在小容器上。
+ * 2. 时长一律取 --dur-1~4，退场取 --dur-out（比入场快）。透明度用 --ease，
+ *    位移缩放用 --ease-spring（带一点过冲）。透明度千万别配 spring，会先冲过 1。
+ * 3. 入场动画一律挂在 :not([hidden]) 上靠「元素重新参与渲染时动画自动重播」实现，
+ *    JS 一行不改。只有需要「退场过程」的（弹窗 / toast / 缓存面板）才走 app.js
+ *    里的 showAnim / hideAnim。
+ *
+ * 坑：.playbar 靠 translateX(-50%) 居中，关键帧里必须把它一起写上，
+ *     否则动画期间居中失效、浮层直接飞到窗口左边。 */
+
+@keyframes rb-fade { from { opacity: 0 } to { opacity: 1 } }
+@keyframes rb-fade-out { from { opacity: 1 } to { opacity: 0 } }
+@keyframes rb-rise { from { transform: translateY(8px) } to { transform: translateY(0) } }
+
+/* 1 编辑器整块出现：第一首歌传完，右栏从空到有，给个「落下来」的过程。
+ *    卡片不做阶梯延迟 —— 那一刻面板、播放栏、列表行、toast 会一起触发，
+ *    再叠 stagger 就像放礼花。 */
+#panel:not([hidden]) {
+  animation: rb-fade var(--dur-3) var(--ease), rb-rise var(--dur-3) var(--ease-spring);
+}
+
+/* 2 底部悬浮试听栏：它是浮层，最该有「浮上来」的感觉 */
+@keyframes pb-rise { from { transform: translate(-50%, 14px) } to { transform: translate(-50%, 0) } }
+.playbar:not([hidden]) {
+  animation: pb-rise var(--dur-3) var(--ease-spring), rb-fade var(--dur-3) var(--ease);
+}
+
+/* 3 歌曲库新行。is-new 只打在本次新增的行上（见 renderFileList），
+ *    否则每次状态刷新（排队 → 分析中 → 就绪）整列都会重播一遍动画。 */
+@keyframes row-slide { from { transform: translateX(-6px) } to { transform: translateX(0) } }
+.file-row.is-new {
+  animation: rb-fade var(--dur-3) var(--ease), row-slide var(--dur-3) var(--ease-spring);
+}
+
+/* 4 清缓存二次确认弹窗：遮罩淡入 + 卡片轻微放大落位 */
+@keyframes modal-pop { from { transform: scale(.96) translateY(6px) } to { transform: scale(1) translateY(0) } }
+.modal:not([hidden]) { animation: rb-fade var(--dur-2) var(--ease); }
+.modal:not([hidden]) .modal-card {
+  animation: rb-fade var(--dur-3) var(--ease), modal-pop var(--dur-3) var(--ease-spring);
+}
+/* 退场：JS 加 .is-out，放完再把 hidden 挂回去（app.js 的 hideAnim）。
+ * 这两条同权重，必须写在入场之后才盖得住。 */
+.modal.is-out { animation: rb-fade-out var(--dur-out) var(--ease); }
+.modal.is-out .modal-card { animation: modal-pop var(--dur-out) var(--ease) reverse; }
+
+/* 5 提示条：入场淡入上移，退场淡出。
+ *    .leaving 与 .show 同权重，靠写在后面生效。 */
+.toast.show {
+  animation: rb-fade var(--dur-3) var(--ease), rb-rise var(--dur-3) var(--ease-spring);
+}
+.toast.leaving { animation: rb-fade-out var(--dur-out) var(--ease) forwards; }
+
+/* 6 缓存面板展开 / 收起。
+ *    边框挪到内层：外层收起后高度归零，边框留在上面会剩一条 2px 的细线。
+ *    内层必须 overflow:hidden + min-height:0，否则 0fr 压不下去，内容会照常溢出。 */
+.cache-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: 0;
+  overflow: hidden;
+  transition: grid-template-rows var(--dur-3) var(--ease);
+}
+.cache-panel.is-open { grid-template-rows: 1fr; }
+.cache-panel > .cpanel-inner {
+  min-height: 0;
+  overflow: hidden;
+  padding-top: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+}
+
+/* 系统开了「减弱动效」就整体关掉：这类用户要的是结果，不是过程。
+ * 写在文件最后，盖掉上面所有声明。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
 }
 

@@ -18,7 +18,7 @@ const FADE_MAX = 3.0;   // 开头渐入时长上限（秒），与后端 config.
 const state = {
   track: null,
   sourceBpm: null,
-  spm: 170,
+  spm: 175,
   mapping: '1:1',
   minRatio: 0.5,
   maxRatio: 2.0,
@@ -36,6 +36,57 @@ const state = {
   current: -1,          // 正在编辑的下标；-1 = 还没选中任何一首
 };
 
+/* ---- 跨会话偏好（localStorage） ----------------------------------------
+ * 只记「人」的偏好（步频、倍率方式、音量、开关、按歌名记勾选），
+ * 不记「歌」的参数（BPM、裁剪区间——那些跟着每首歌的 params 走）。
+ * 跑步者目标步频基本固定，每次打开都要重拖滑块是最大的日常摩擦。
+ * 桌面版 webview 已配 private_mode=False，localStorage 两边都落盘。 */
+const PREFS_KEY = 'runbeat.prefs.v1';
+
+const Prefs = {
+  data: (() => {
+    try {
+      return JSON.parse(localStorage.getItem(PREFS_KEY)) || {};
+    } catch {
+      return {};
+    }
+  })(),
+  get(key, fallback) {
+    const v = this.data[key];
+    return v === undefined || v === null ? fallback : v;
+  },
+  set(key, value) {
+    this.data[key] = value;
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify(this.data));
+    } catch {
+      /* 隐私模式等场景写不进去就算了，偏好丢失不致命 */
+    }
+  },
+  /* 按歌名记勾选：存成一个 {name: bool} 映射，同名歌再次上传自动恢复 */
+  getChecked(name) {
+    return this.get('checked', {})[name];
+  },
+  setChecked(name, on) {
+    const map = this.get('checked', {});
+    if (map[name] === on) return;
+    if (on) {
+      map[name] = true;
+    } else {
+      delete map[name];           // 不勾的就不留，映射不会无限膨胀
+    }
+    this.set('checked', map);
+  },
+};
+
+/* 把持久化的全局开关恢复到 checkbox 上（DOM 已就绪，script 在 body 末尾）。
+ * 只恢复勾选类；spm/mapping/metroGain 走 defaultParams（需要每首歌的范围来夹取）。 */
+function restoreGlobalToggles() {
+  $('previewMetro').checked = Prefs.get('previewMetro', false);
+  $('exportMetro').checked = Prefs.get('exportMetro', false);
+  updateMetroVolRow();
+}
+
 /* ---- 启动状态：预热进度 + 新版本 -------------------------------------
  * 打包版首次运行要现场编译 numba（约 1~2 分钟），这期间上传的第一首歌会等很久。
  * 不提前说清楚，用户只会以为程序卡死了。状态由后端 /api/health 一并给出。 */
@@ -48,7 +99,9 @@ const startup = {
 
 const liveAudio = $('liveAudio');
 const metroAudio = $('metroAudio');
-let activeMode = null;      // 'live' | 'metro' | null
+let activeMode = null;      // 'live'(成品效果) | 'clip'(只裁剪) | 'speed'(裁剪+变速) | 'metro' | null
+/* 三级试听共用 liveAudio，逐级累计：clip=一级（原速裁剪）、speed=二级（含变速）、
+ * live=三级（再按开关叠节拍声）。节拍排程只认 'live'；波形时间轴三者也同一套。 */
 let seekDebounce = null;
 let bpmDebounce = null;     // 手改 BPM 后重取拍点的防抖计时器
 let beatInfo = { beat_count: 0, interval_cv: 0, detected_count: 0 };
@@ -105,13 +158,49 @@ function escapeHtml(str) {
   ));
 }
 
+/* 退场时长的唯一出处，必须和 style.css 的 --dur-out（170ms）、--dur-3（280ms）对上：
+ * JS 要在动画真正放完的那一刻才把 hidden 挂回去，早了动画被截、晚了元素多留一截。
+ * 改 CSS 的时长，这两个数跟着改。 */
+const ANIM_OUT_MS = 170;
+const ANIM_PANEL_MS = 280;
+
+/* 带「退场过程」的显隐。[hidden] 是 display:none、不可过渡，所以消失必须分两步：
+ * 先加 .is-out 放动画，放完再挂 hidden。期间若又被调用 showAnim，待执行的隐藏会取消。
+ * 只用在需要退场动画的元素上（弹窗、缓存面板）；纯入场的交给 CSS 的
+ * :not([hidden]) —— 元素重新参与渲染时动画会自动重播，JS 一行都不用改。 */
+const animTimers = new WeakMap();
+function showAnim(el, outCls) {
+  const t = animTimers.get(el);
+  if (t) { clearTimeout(t); animTimers.delete(el); }
+  el.classList.remove(outCls);
+  el.hidden = false;
+}
+function hideAnim(el, outCls, dur = ANIM_OUT_MS) {
+  el.classList.add(outCls);
+  const t = setTimeout(() => {
+    el.classList.remove(outCls);
+    el.hidden = true;
+    animTimers.delete(el);
+  }, dur);
+  animTimers.set(el, t);
+}
+
 let toastTimer = null;
+let toastOutTimer = null;
 function toast(message, kind = 'info') {
   const el = $('toast');
-  el.textContent = message;
-  el.className = 'toast show ' + kind;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.className = 'toast'; }, 6000);
+  clearTimeout(toastOutTimer);
+  el.textContent = message;
+  // 连着来两条提示时类名没变、入场动画不会重播 —— 先摘掉 show，强制回流，再加回去
+  el.className = 'toast ' + kind;
+  void el.offsetWidth;
+  el.className = 'toast show ' + kind;
+
+  toastTimer = setTimeout(() => {
+    el.classList.add('leaving');                                   // 先淡出
+    toastOutTimer = setTimeout(() => { el.className = 'toast'; }, ANIM_OUT_MS);
+  }, 6000);
 }
 
 function setBtnLoading(btn, on, busyText) {
@@ -357,6 +446,7 @@ function waveTick() {
   // 逐帧判断而不是靠 timeupdate（约 250ms 才响一次，尾巴会拖出去）。
   if (WAVE.source === 'live' && clipActive() && WAVE.time >= clipRange().end - 0.02) {
     $('seek').value = 0;         // 进度条是相对选区的，归零 = 回到区间开头
+  syncSeekFill();
     stopAll();
     drawWave();
     return;
@@ -388,26 +478,46 @@ function stopWave() {
  * 必须收起来 —— 放这里是因为停下来的路径不止一条。 */
 function setActive(mode) {
   activeMode = mode;
-  WAVE.source = mode;
+  // clip/speed 也走 liveAudio，波形时间轴与 live 同一套，只把 metro 单独区分
+  WAVE.source = mode === 'metro' ? 'metro' : mode ? 'live' : null;
   if (!mode) $('nowPlaying').hidden = true;
   syncBeatPulse();
-  syncClipPreviewBtn();
+  syncPreviewBtns();
+  syncPlayBtn();
 }
 
-/* 「节拍声闪一下」的小点：只有即时试听且开着节拍声时才出现。 */
+/* 「节拍声闪一下」的小点：只有即时试听且开着节拍声时才出现（变速试听同样算）。 */
 function syncBeatPulse() {
   const el = $('beatPulse');
-  if (el) el.hidden = !(activeMode === 'live' && previewMetronomeOn());
+  const withMetronome = activeMode === 'live' || activeMode === 'speed';
+  if (el) el.hidden = !(withMetronome && previewMetronomeOn());
 }
 
-/* 试听中时按钮就是停止键。两处按钮控制同一播放（liveAudio），状态必须一致。 */
-function syncClipPreviewBtn() {
-  const btn = $('clipPreviewBtn');
+/* 两级片段试听按钮的「播放中=停止」态。三路试听共用 liveAudio，但每个按钮
+ * 只反映自己那一路的状态：正在放变速试听时，裁剪按钮仍显示可点（点了会切换）。 */
+function syncPreviewBtns() {
+  const defs = [['clipPreviewBtn', 'clip', '试听裁剪'], ['speedPreviewBtn', 'speed', '试听变速']];
+  for (const [id, mode, idleLabel] of defs) {
+    const btn = $(id);
+    if (!btn) continue;
+    const playing = activeMode === mode;
+    const label = btn.querySelector('.btn-label');
+    if (label) label.textContent = playing ? '停止试听' : idleLabel;
+    btn.classList.toggle('primary', !playing);
+  }
+}
+
+/* 底部播放键是「播放/暂停」合一：这一路正在放就换成暂停图标，其余情况是播放图标。
+ * 只认 'live' —— 裁剪/变速试听各有自己的按钮在管。 */
+function syncPlayBtn() {
+  const btn = $('playLiveBtn');
   if (!btn) return;
-  const playing = activeMode === 'live';
-  const label = btn.querySelector('.btn-label');
-  if (label) label.textContent = playing ? '停止试听' : '试听这段';
-  btn.classList.toggle('primary', !playing);
+  const playing = activeMode === 'live' && !liveAudio.paused;
+  btn.classList.toggle('is-playing', playing);
+  btn.title = playing
+    ? '暂停（再点一次从暂停处接着放）'
+    : '从进度条位置播放：裁剪 + 变速 + 节拍声（节拍声按第 3 步开关）';
+  btn.setAttribute('aria-label', playing ? '暂停试听' : '试听成品');
 }
 
 /* ------------------------------------------------------------ 界面渲染 */
@@ -638,7 +748,9 @@ async function loadWaveform(fileId) {
 }
 
 const NOW_PLAYING_TAG = {
-  live: '试听（本地变速）',
+  live: '试听成品（最终效果）',
+  clip: '裁剪试听（原速）',
+  speed: '试听变速（裁剪 + 变速）',
   metro: '节拍对齐（原曲 + 节拍声）',
 };
 
@@ -896,11 +1008,18 @@ function repositionAfterClip(anchor) {
   syncSeekBar(t);                   // 进度条落到 anchor 那一点 = 下次播放的起点
   setClipTip(anchor);
 
+  if ((activeMode === 'clip' || activeMode === 'speed') && !liveAudio.paused) {
+    // 两级片段试听正放着又动了选区：直接停。片段试听的语义是「听刚才那段」，
+    // 选区一变它就过期了，跳着续放只会让人更糊涂。
+    stopAll();
+    return;
+  }
+
   if (activeMode === 'live' && !liveAudio.paused) {
     // 正在放：跳到新位置接着放
     try { liveAudio.currentTime = t; } catch (e) { /* 元数据未就绪时忽略 */ }
     armClickSettle();               // 位置跳了：排出去的 click 作废，等媒体时钟稳下来再对准
-    // 跳到新起点等于从这一段的开头接着放，和点「试听这段」是同一种开头，也该渐入；
+    // 跳到新起点等于从这一段的开头接着放，和点「试听裁剪」是同一种开头，也该渐入；
     // 拖终点落在终点前 5 秒（不是段首）就照旧直接切进去，别把收尾也淡一遍。
     const fade = anchor === 'start' ? fadeSeconds() : 0;
     if (fade > 0) startMusicFade(fade);
@@ -934,16 +1053,19 @@ function parseClipTime(text) {
 
 /* 一首歌的初始参数。每首独立的起点：之后在编辑器里改的都只写回这一首的 params。 */
 function defaultParams(data) {
+  const lo = data.defaults.spm_min;
+  const hi = data.defaults.spm_max;
+  const clamp = (v) => Math.min(hi, Math.max(lo, v));
+  /* 记住的偏好优先，但必须夹进这首歌允许的范围里（不同歌范围不同） */
   return {
     sourceBpm: data.detected_bpm,
-    spm: data.defaults.spm,
-    mapping: '1:1',
+    spm: clamp(Prefs.get('spm', data.defaults.spm)),
+    mapping: Prefs.get('mapping', '1:1'),
     minRatio: data.defaults.min_ratio,
     maxRatio: data.defaults.max_ratio,
-    metroGain: 0.5,
-    previewMetro: false,
-    exportMetro: false,
-    keepPitch: true,
+    metroGain: Prefs.get('metroGain', 0.5),
+    previewMetro: Prefs.get('previewMetro', false),
+    exportMetro: Prefs.get('exportMetro', false),
     clip: { start: 0, end: null, fade: false, fadeSec: data.defaults.fade_sec },
   };
 }
@@ -962,7 +1084,6 @@ function snapshotCurrent() {
     metroGain: state.metroGain,
     previewMetro: $('previewMetro').checked,
     exportMetro: $('exportMetro').checked,
-    keepPitch: $('keepPitch').checked,
     // 时长存输入框里的原始数字（不是 fadeSeconds() 的结果）—— 没勾时也要记住填了多少
     clip: {
       start: state.clip.start,
@@ -989,7 +1110,6 @@ function restoreInto(index) {
   $('clipFadeSec').value = String(p.clip.fadeSec || 1);
   $('previewMetro').checked = p.previewMetro;
   $('exportMetro').checked = p.exportMetro;
-  $('keepPitch').checked = p.keepPitch;
   syncFadeUI();
 }
 
@@ -1063,7 +1183,8 @@ async function handleFiles(fileList) {
       state.files[row] = {
         ...data,
         params: defaultParams(data),
-        checked: true,
+        // 新歌默认勾上；同名歌恢复上次的勾选状态（上次特意取消过就别再勾）
+        checked: Prefs.getChecked(data.name ?? f.name) ?? true,
         status: 'ok',
       };
       okCount++;
@@ -1132,6 +1253,7 @@ function initUI() {
   const t = state.track;
   // 批量模式下上传区**不隐藏** —— 随时可以再拖几首进来（追加到列表末尾）。
   $('panel').hidden = false;
+  $('playerBar').hidden = false;   // 底部常驻播放条跟着编辑器一起出现
 
   const okList = state.files.filter((f) => f.status === 'ok');
   const nth = okList.indexOf(t) + 1;
@@ -1154,6 +1276,7 @@ function initUI() {
   $('metroGain').value = Math.round(state.metroGain * 100);
 
   $('seek').value = 0;
+  syncSeekFill();
   $('seekTime').textContent = '00:00';
   $('seekTotal').textContent = formatTime(t.duration);
   $('exportResult').innerHTML = '';
@@ -1195,10 +1318,16 @@ function initUI() {
 
 /* ------------------------------------------------------------ 文件列表 */
 
+/* 上一次渲染出现过的行 key，用来认出「本次新增」的行（只有它们播入场动画） */
+let renderedFileKeys = new Set();
+
 function renderFileList() {
   const card = $('listCard');
   const okList = state.files.filter((f) => f.status === 'ok');
   const checked = okList.filter((f) => f.checked);
+
+  // 首次引导只在还没歌的时候显示
+  $('firstHint').hidden = state.files.length > 0;
 
   card.hidden = state.files.length === 0;
   if (card.hidden) {
@@ -1210,20 +1339,30 @@ function renderFileList() {
   $('listSum').textContent = state.busy
     ? `正在处理…（${okList.length} / ${state.files.length} 完成）`
     : `${state.files.length} 首 · 已选 ${checked.length} 首 · 可导出 ${okList.length} 首`;
-  $('fileList').innerHTML = state.files.map(fileRowHtml).join('');
+  // 只给「本次新增」的行加入场动画：整列每次都是整体重绘的，不区分的话
+  // 每行从「排队中」变「就绪」都会重播一遍，整列会一直闪。
+  // 用歌名当 key —— 同一首歌排队 → 就绪名字不变，所以只在真正新增时动一次。
+  const prevKeys = renderedFileKeys;
+  const nextKeys = new Set();
+  $('fileList').innerHTML = state.files.map((f, i) => {
+    const key = f.name || f.file_id || String(i);
+    nextKeys.add(key);
+    return fileRowHtml(f, i, prevKeys.has(key) ? '' : ' is-new');
+  }).join('');
+  renderedFileKeys = nextKeys;
   $('applyAllBtn').disabled = state.current < 0;
 
   renderBatchCard();
 }
 
-function fileRowHtml(f, i) {
+function fileRowHtml(f, i, extra = '') {
   const on = i === state.current ? ' on' : '';
 
   // 失败的行没有勾选框、也点不进编辑器 —— 留个等宽空位让各列对齐
   // 排队中 / 分析中：没有勾选框、点不进编辑器，状态列给动画
   if (f.status === 'wait' || f.status === 'loading') {
     const loading = f.status === 'loading';
-    return `<div class="file-row" data-i="${i}" data-wait="1">
+    return `<div class="file-row${extra}" data-i="${i}" data-wait="1">
       <span style="flex:none;width:15px"></span>
       <div class="fr-main">
         <div class="fr-name">${escapeHtml(f.name)}</div>
@@ -1235,7 +1374,7 @@ function fileRowHtml(f, i) {
   }
 
   if (f.status !== 'ok') {
-    return `<div class="file-row${on}" data-i="${i}" data-fail="1">
+    return `<div class="file-row${on}${extra}" data-i="${i}" data-fail="1">
       <span style="flex:none;width:15px"></span>
       <div class="fr-main">
         <div class="fr-name">${escapeHtml(f.name)}</div>
@@ -1247,12 +1386,12 @@ function fileRowHtml(f, i) {
   }
 
   const plan = planOf(f.params);
-  // 被范围截断是个要紧信息：用户设了 170，实际出 96，得让他一眼看见
+  // 被范围截断是个要紧信息：用户设了 175，实际出 96，得让他一眼看见
   const note = plan.clamped
     ? `${f.params.mapping} · 实际 ${plan.actualSpm.toFixed(0)} spm`
     : f.params.mapping;
 
-  return `<div class="file-row${on}" data-i="${i}">
+  return `<div class="file-row${on}${extra}" data-i="${i}">
     <input type="checkbox" data-check="${i}"${f.checked ? ' checked' : ''}>
     <div class="fr-main">
       <div class="fr-name">${escapeHtml(f.name)}</div>
@@ -1289,10 +1428,12 @@ function renderBatchCard() {
 function clearList() {
   stopAll();
   state.files = [];
+  renderedFileKeys = new Set();
   state.current = -1;
   state.track = null;
   resetPlayer();
   $('panel').hidden = true;
+  $('playerBar').hidden = true;    // 列表清空了，底部播放条也没意义
   renderFileList();
   setDropzoneBusy(0);
   toast('列表已清空。磁盘上的缓存文件还在，需要的话去「缓存与数据」里清。', 'info');
@@ -1319,7 +1460,6 @@ function applyToAll() {
       metroGain: p.metroGain,
       previewMetro: p.previewMetro,
       exportMetro: p.exportMetro,
-      keepPitch: p.keepPitch,
     };
     n += 1;
   });
@@ -1624,7 +1764,7 @@ function requeueClicks() {
 }
 
 function liveClickTick() {
-  if (activeMode !== 'live' || !state.track) return;
+  if ((activeMode !== 'live' && activeMode !== 'speed') || !state.track) return;
   if (liveAudio.paused || !previewMetronomeOn()) return;
   const ctx = ensureAudioCtx();
   if (!ctx) return;
@@ -1692,14 +1832,49 @@ startClickTicker();
  * 让在途的异步起播作废（节拍片段要先在后端生成，那几秒里用户可能已经改了主意）。 */
 let playToken = 0;
 
+/* 批量结果行「试听成品」用的第四路声音。也要纳入一路出声原则：
+ * haltAudio 停它，它开播前也 haltAudio，任何时刻只有一路出声。 */
+let resultAudio = null;
+
 function haltAudio() {
   playToken++;
   stopScheduledClicks();
   try { liveAudio.pause(); } catch (e) { /* noop */ }
   try { metroAudio.pause(); } catch (e) { /* noop */ }
+  try { if (resultAudio) resultAudio.pause(); } catch (e) { /* noop */ }
   clearMusicFade();               // 半截渐入要复位，否则音量会卡在中间值
   setMetroBtn(false);
   setActive(null);
+  syncResultPlayButtons();
+}
+
+/* 把批量结果里所有试听按钮的图标对齐到 resultAudio 的实际状态 */
+function syncResultPlayButtons() {
+  document.querySelectorAll('#batchResult .mini-play').forEach((btn) => {
+    const playing = resultAudio
+      && !resultAudio.paused
+      && resultAudio.dataset.url === btn.dataset.url;
+    btn.textContent = playing ? '⏸' : '▶';
+    btn.title = playing ? '停止试听' : '试听这个成品';
+  });
+}
+
+function toggleResultPreview(btn) {
+  const url = btn.dataset.url;
+  if (resultAudio && resultAudio.dataset.url === url && !resultAudio.paused) {
+    resultAudio.pause();          // 再点一下 = 停
+    return;
+  }
+  haltAudio();                    // 一路出声：先把试听/节拍那几路停掉
+  if (!resultAudio || resultAudio.dataset.url !== url) {
+    if (resultAudio) resultAudio.pause();
+    resultAudio = new Audio(url);
+    resultAudio.dataset.url = url;
+    resultAudio.addEventListener('play', syncResultPlayButtons);
+    resultAudio.addEventListener('pause', syncResultPlayButtons);
+    resultAudio.addEventListener('ended', syncResultPlayButtons);
+  }
+  resultAudio.play().catch(() => toast('浏览器阻止了播放，再点一次试试', 'error'));
 }
 
 function resetPlayer() {
@@ -1720,6 +1895,7 @@ function resetPlayer() {
   delete metroAudio.dataset.src;
   $('nowPlaying').hidden = true;
   $('seek').value = 0;
+  syncSeekFill();
   WAVE.peaks = null;
   WAVE.buckets = 0;
   WAVE.beats = [];
@@ -1741,8 +1917,10 @@ function ensureLiveSource() {
   }
 }
 
+/* 变速永远保持音高（后端 atempo 与浏览器 preservesPitch 都恒为 true），
+ * 这里只把状态如实标出来。 */
 function livePitchNote() {
-  return $('keepPitch').checked ? '音高不变' : '音高随速度变化';
+  return '音高不变';
 }
 
 function liveLabel(ratio) {
@@ -1755,34 +1933,40 @@ function liveLabel(ratio) {
 function syncLiveRate() {
   const plan = computePlan();
   liveAudio.playbackRate = plan.ratio;
-  setPreservesPitch(liveAudio, $('keepPitch').checked);
+  setPreservesPitch(liveAudio, true);
   requeueClicks();     // 倍率一变，成品时间轴上的 click 位置整体挪了：清掉旧队列重新排
-  showNowPlaying('live', liveLabel(plan.ratio));
+  // 变速试听放着的也要如实标「试听变速」，别让人误以为节拍声也在响
+  showNowPlaying(activeMode === 'speed' ? 'speed' : 'live', liveLabel(plan.ratio));
 }
 
-async function playLive() {
+async function playLive(opts = {}) {
+  const mode = opts.mode || 'live';   // 'live'=成品效果 | 'clip'=只裁剪 | 'speed'=裁剪+变速
   if (!state.track) return;
   const plan = computePlan();
 
   haltAudio();                    // 让出播放权：节拍对齐、上一路试听、半截渐入一起停
   unlockAudio();                  // 趁着这次点击，把音频上下文解锁掉
 
-  const start = seekStartSeconds();
+  // 成品试听与变速试听都从进度条当前位置接着放（拖进度条定位后点按钮就从那儿听）；
+  // 裁剪试听固定从段首（点它就是想听开头接得顺不顺）。
+  const start = mode === 'clip' ? clipRange().start : seekStartSeconds();
   // 只在「从选区起点开始放」时渐入。拖进度条到中间再播是跳着听，不该再淡一次。
   const wantFade = fadeSeconds();
   const fade = wantFade > 0 && Math.abs(start - clipRange().start) < 0.3 ? wantFade : 0;
-  if (previewMetronomeOn()) {     // 要叠节拍声，就把音乐接进同一张音频图（对不上的根因就在这）
-    attachMusicToGraph();
+  if (mode !== 'clip' && previewMetronomeOn()) {  // 裁剪试听是「只听裁剪」的原速演示，不叠节拍声
+    attachMusicToGraph();         // 把音乐接进同一张音频图（对不上的根因就在这）
   }
   if (fade > 0) liveAudio.volume = 0;   // 先压到静音，等真播起来了再往上拉
 
   ensureLiveSource();
-  setPreservesPitch(liveAudio, $('keepPitch').checked);
-  liveAudio.playbackRate = plan.ratio;
+  setPreservesPitch(liveAudio, true);
+  // 裁剪试听必须原速：它演示的是「裁剪这一层」做了什么，动了速度就串味了
+  liveAudio.playbackRate = mode === 'clip' ? 1 : plan.ratio;
 
   if (Math.abs(liveAudio.currentTime - start) > 0.4) {
     try { liveAudio.currentTime = start; } catch (e) { /* 元数据未就绪时忽略 */ }
   }
+  syncSeekBar(start);             // 进度条立刻归位，别等第一次 timeupdate
 
   try {
     await liveAudio.play();
@@ -1793,34 +1977,65 @@ async function playLive() {
   }
   if (fade > 0) startMusicFade(fade);
 
-  armClickSettle();               // 等媒体时钟稳下来再对准，从当前位置往后的 click 才对得上
-  setActive('live');
+  if (mode !== 'clip') armClickSettle();  // 裁剪试听不排 click；变速/成品试听位置跳了都要重新对准
+  setActive(mode);
   WAVE.pinned = false;            // 整首歌 → 视窗跟着播放滚动
   WAVE.windowSec = waveWindow();
   WAVE.time = liveAudio.currentTime || 0;
   updateWaveView();
   startWave();
 
-  showNowPlaying('live', liveLabel(plan.ratio));
+  // 变速试听现在也会叠节拍声，统一用 liveLabel（它会按开关带上「含节拍声」）
+  showNowPlaying(mode, mode === 'clip'
+    ? '×1.000 · 原速（只含裁剪）'
+    : liveLabel(plan.ratio));
 }
 
-/* 裁剪卡片的试听：正在试听就停，否则**从段首**开始放（先把进度条归位）。
- * 必须归位：playLive 是按「进度条那一点」起播的，而进度条播过一次或拖过之后
- * 就停在中间 —— 那时点它会从半截开始放，既听不到这段的开头（用户点它本就是想
- * 听开头接得顺不顺），渐入也会被当成「跳着听」而跳过。想从中间接着听走播放条。
- * 其它方面走同一套播放链路：变速、节拍声开关、播到选区末尾自动停，全部一致。 */
+/* 暂停 ≠ 停止：播放位置留着，只把声音停掉。
+ * 拍点排程必须一起掐掉 —— 提前量有 2 秒，光停声音的话静音里还会继续排 click。
+ * 恢复不另写一套：走 playLive() 即可，它本来就按进度条当前位置起播，而进度条
+ * 正停在暂停处，所以「继续」和「从当前位置起播」天然是同一件事。 */
+function pauseLive() {
+  playToken++;                    // 作废还在飞的排程
+  stopScheduledClicks();
+  clearMusicFade();               // 半截渐入要复位，否则音量会卡在中间值
+  try { liveAudio.pause(); } catch (e) { /* noop */ }
+  setActive(null);                // 按钮回播放态、闪灯收起、nowPlaying 收掉
+  WAVE.source = 'live';           // 但暂停不是清空：让播放头停在原地别消失
+  stopWave();
+}
+
+/* 底部播放键：播放/暂停合一。 */
+function toggleLivePreview() {
+  if (!state.track) return;
+  if (activeMode === 'live' && !liveAudio.paused) { pauseLive(); return; }
+  playLive();
+}
+
+/* 卡 2 的一级试听：只听裁剪效果（原速、无节拍声）。正在放就停。
+ * 固定从段首起播：playLive 的 live 模式是按「进度条那一点」起播的，而进度条
+ * 播过一次或拖过之后就停在中间 —— 那样既听不到这段的开头，渐入也会被当成
+ * 「跳着听」而跳过。想从中间接着听走「试听成品」。 */
 function toggleClipPreview() {
   if (!state.track) return;
-  if (activeMode === 'live' && !liveAudio.paused) { stopAll(); return; }
-  syncSeekBar(clipRange().start);
-  playLive();
+  if (activeMode === 'clip' && !liveAudio.paused) { stopAll(); return; }
+  playLive({ mode: 'clip' });
+}
+
+/* 卡 3 的二级试听：裁剪 + 变速的累计效果，从进度条当前位置起播（拖动进度条定位后
+ * 点它就从那儿听），勾了「试听时叠加节拍声」也一起叠。 */
+function toggleSpeedPreview() {
+  if (!state.track) return;
+  if (activeMode === 'speed' && !liveAudio.paused) { stopAll(); return; }
+  playLive({ mode: 'speed' });
 }
 
 /* 改步频 / 换算开关时，让正在播放的声音自动跟上 */
 function autoUpdatePlaying() {
   if (!state.track || !activeMode) return;
-  // 只剩即时试听一种播放源：它走浏览器本地变速，改速率是连续的，零延迟
-  if (activeMode === 'live') syncLiveRate();
+  // 成品试听和变速试听都走浏览器本地变速，改速率是连续的，零延迟；
+  // 裁剪试听是原速演示，步频怎么改它都不动。
+  if (activeMode === 'live' || activeMode === 'speed') syncLiveRate();
 }
 
 function stopAll() {
@@ -2085,7 +2300,7 @@ async function batchExport() {
     a.remove();
     await new Promise((r) => setTimeout(r, 400));
   }
-  toast(`已开始下载 ${done.length} 个文件`, 'info');
+  toast(`已开始下载 ${done.length} 个文件 · 节拍已按各自步频对齐，放进播放器即可使用`, 'info');
 }
 
 async function packageAndDownload(items) {
@@ -2106,7 +2321,7 @@ async function packageAndDownload(items) {
     if (!res.ok) throw new Error(data.detail || `打包失败（HTTP ${res.status}）`);
 
     // 先落最终文案再触发下载，否则进度条会永远停在「正在打包…」
-    const done = `已打包 ${data.count} 首（${formatBytes(data.bytes)}），开始下载`;
+    const done = `已打包 ${data.count} 首（${formatBytes(data.bytes)}），开始下载 · 放进播放器即可使用`;
     $('bpText').textContent = done;
     location.href = data.download_url;
     toast(done, 'info');
@@ -2123,7 +2338,9 @@ function renderBatchResult(done, failed) {
     .map(
       (d) => `<div class="row"><span>${escapeHtml(d.filename)}</span>`
         + `<b>×${d.ratio.toFixed(3)} · ${Math.round(d.actual_spm)} spm`
-        + ` · ${formatTime(d.output_duration)}</b></div>`
+        + ` · ${formatTime(d.output_duration)}`
+        + `<button class="mini-play" type="button" data-url="${escapeHtml(d.url)}"`
+        + ` title="试听这个成品">▶</button></b></div>`
     )
     .join('');
   const errs = failed
@@ -2148,6 +2365,12 @@ $('dropzone').addEventListener('click', () => $('fileInput').click());
 $('changeFileBtn').addEventListener('click', () => $('fileInput').click());
 $('topAddBtn').addEventListener('click', () => $('fileInput').click());
 
+// 批量结果行的试听按钮（行是 innerHTML 重建的，用委托监听容器）
+$('batchResult').addEventListener('click', (e) => {
+  const btn = e.target.closest('.mini-play');
+  if (btn) toggleResultPreview(btn);
+});
+
 $('fileInput').addEventListener('change', (e) => {
   if (e.target.files && e.target.files.length) handleFiles(e.target.files);
   e.target.value = '';
@@ -2163,6 +2386,7 @@ $('fileList').addEventListener('click', (e) => {
 
   if (e.target.matches('input[type="checkbox"]')) {
     entry.checked = e.target.checked;
+    Prefs.setChecked(entry.name, entry.checked);   // 按歌名记住，下次上传同名歌自动恢复
     renderFileList();
     return;
   }
@@ -2217,6 +2441,7 @@ $('bpmInput').addEventListener('input', () => {
 $('spmRange').addEventListener('input', () => {
   state.spm = Number($('spmRange').value);
   $('spmValue').textContent = state.spm;
+  Prefs.set('spm', state.spm);        // 步频是跑步者的固定习惯，记住
   renderMappingHint();
   renderStatus();
   autoUpdatePlaying();
@@ -2226,6 +2451,7 @@ $('mappingGroup').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-mapping]');
   if (!btn) return;
   state.mapping = btn.dataset.mapping;
+  Prefs.set('mapping', state.mapping);
   document.querySelectorAll('#mappingGroup button').forEach((b) => {
     b.classList.toggle('active', b === btn);
   });
@@ -2254,7 +2480,7 @@ $('resetRatioBtn').addEventListener('click', () => {
   renderStatus();
 });
 
-$('playLiveBtn').addEventListener('click', playLive);
+$('playLiveBtn').addEventListener('click', toggleLivePreview);  // 播放/暂停合一
 $('stopBtn').addEventListener('click', stopAll);
 $('exportBtn').addEventListener('click', doExport);
 $('metroBtn').addEventListener('click', toggleMetronome);
@@ -2356,11 +2582,13 @@ $('clipFadeSec').addEventListener('change', () => {
 });
 
 $('clipPreviewBtn').addEventListener('click', toggleClipPreview);
+$('speedPreviewBtn').addEventListener('click', toggleSpeedPreview);
 
 $('seek').addEventListener('input', () => {
   if (!state.track) return;
   const t = seekStartSeconds();
   $('seekTime').textContent = formatTime(t);
+  syncSeekFill();          // 拖动时填充色要跟着手指走，不能等松手
   WAVE.time = t;
   if (WAVE.source === 'live') {
     try { liveAudio.currentTime = t; } catch (e) { /* noop */ }
@@ -2381,11 +2609,6 @@ $('seek').addEventListener('change', () => {
   }
 });
 
-$('keepPitch').addEventListener('change', () => {
-  setPreservesPitch(liveAudio, $('keepPitch').checked);
-  if (activeMode === 'live') syncLiveRate();
-});
-
 /* ---- 节拍声开关与音量（试听与导出共用同一个音量，滑块只放一个） */
 
 function updateMetroVolRow() {
@@ -2395,35 +2618,42 @@ function updateMetroVolRow() {
   $('exportMetroHint').textContent = $('exportMetro').checked
     ? `成品会叠一层节拍声（音量 ${pct}%，在上方「试听」里调），下载文件名带 _beat 后缀。`
     : '';
+  // 蓝牙延迟提示只在真要听节拍声时才有意义，平时藏起来
+  $('btLatencyHint').hidden = !$('previewMetro').checked && !$('exportMetro').checked;
 }
 
 $('previewMetro').addEventListener('change', () => {
+  Prefs.set('previewMetro', $('previewMetro').checked);
   updateMetroVolRow();
   syncBeatPulse();                 // 关掉时小点要立刻收起来
   unlockAudio();                   // 勾选本身就是一次点击，顺手把音频上下文解锁掉
   if (previewMetronomeOn()) {
     attachMusicToGraph();          // 播放中途勾上也要接进同一张音频图，否则这一路照样错开
   }
-  if (activeMode === 'live') {
+  if (activeMode === 'live' || activeMode === 'speed') {
     // 开关一动就即时生效：开着就重新对准，关掉就把已排程的 click 掐掉
     if (previewMetronomeOn()) {
       requeueClicks();
     } else {
       stopScheduledClicks();
     }
-    showNowPlaying('live', liveLabel(liveAudio.playbackRate || 1));
+    showNowPlaying(activeMode, liveLabel(liveAudio.playbackRate || 1));
   }
 });
 
-$('exportMetro').addEventListener('change', updateMetroVolRow);
+$('exportMetro').addEventListener('change', () => {
+  Prefs.set('exportMetro', $('exportMetro').checked);
+  updateMetroVolRow();
+});
 
 $('metroGain').addEventListener('input', () => {
   state.metroGain = Number($('metroGain').value) / 100;
+  Prefs.set('metroGain', state.metroGain);
   // 共用音量节点，改一下立刻生效（排程提前了 2 秒，落到节点上才不用等）
   if (clickBus) clickBus.gain.value = Math.max(0, state.metroGain);
   updateMetroVolRow();
-  if (activeMode === 'live' && previewMetronomeOn()) {
-    showNowPlaying('live', liveLabel(liveAudio.playbackRate || 1));
+  if ((activeMode === 'live' || activeMode === 'speed') && previewMetronomeOn()) {
+    showNowPlaying(activeMode, liveLabel(liveAudio.playbackRate || 1));
   }
 });
 
@@ -2434,10 +2664,20 @@ function syncSeekBar(originalTime) {
   const frac = r.length > 0 ? (t - r.start) / r.length : 0;
   $('seek').value = Math.round(frac * 1000);
   $('seekTime').textContent = formatTime(t);
+  syncSeekFill();
+}
+
+/* 已播部分的高亮靠 --fill（百分比），原生 range 没有「已播颜色」这回事。
+ * 变量必须写在 .seek-track 上：自绘的填充条和滑块是 #seek 的**兄弟节点**，
+ * CSS 变量只向下继承，写在 #seek 上它们读不到。
+ * 凡是直接改 seek.value 而不经 syncSeekBar 的地方都要补一句，否则填充会停在旧位置。 */
+function syncSeekFill() {
+  const v = Number($('seek').value) || 0;
+  $('seekTrack').style.setProperty('--fill', (v / 10).toFixed(2) + '%');   // value 是 0~1000
 }
 
 liveAudio.addEventListener('timeupdate', () => {
-  if (activeMode !== 'live' || !state.track) return;
+  if (!state.track || (activeMode !== 'live' && activeMode !== 'clip' && activeMode !== 'speed')) return;
   syncSeekBar(liveAudio.currentTime);
 });
 
@@ -2461,7 +2701,9 @@ window.addEventListener('resize', () => {
 });
 
 liveAudio.addEventListener('error', () => {
-  if (activeMode === 'live') toast('音频播放出错，试试重新上传', 'error');
+  if (activeMode === 'live' || activeMode === 'clip' || activeMode === 'speed') {
+    toast('音频播放出错，试试重新上传', 'error');
+  }
 });
 
 /* ------------------------------------------------------------ 缓存与数据 */
@@ -2579,10 +2821,29 @@ function updateCachePicked() {
   btn.textContent = picked.length ? `清理选中的 ${files} 个文件` : '清理选中的';
 }
 
+/* 缓存面板要走高度动画（CSS 的 grid-template-rows 0fr↔1fr），不能一步切 hidden：
+ *   展开 —— 先摘 hidden，强制回流，再加 .is-open。少了那次回流，
+ *           「开始渲染」和「加类」会被并成同一帧，transition 直接跳到终点、看不到过程。
+ *   收起 —— 先撤 .is-open 放动画，放完才挂 hidden（提前挂就没动画了）。 */
+let cachePanelTimer = null;
+function setCachePanelOpen(open) {
+  const panel = $('cachePanel');
+  clearTimeout(cachePanelTimer);
+  if (open) {
+    panel.hidden = false;
+    void panel.offsetHeight;
+    panel.classList.add('is-open');
+  } else {
+    panel.classList.remove('is-open');
+    cachePanelTimer = setTimeout(() => { panel.hidden = true; }, ANIM_PANEL_MS);
+  }
+}
+
 function toggleCachePanel(force) {
   const panel = $('cachePanel');
-  const open = force === undefined ? panel.hidden : !!force;
-  panel.hidden = !open;
+  // 状态认 .is-open 而不是 hidden：收起动画那 280ms 里 hidden 还没挂上，看它会误判成「已收起」
+  const open = force === undefined ? !panel.classList.contains('is-open') : !!force;
+  setCachePanelOpen(open);
   $('cacheToggleBtn').querySelector('.btn-label').textContent = open ? '收起' : '清理缓存';
   if (open) {
     cachePicked = new Set(CACHE_SAFE);    // 每次展开都回到「安全」那一档
@@ -2646,11 +2907,11 @@ function openCacheModal() {
     warn.append(mark, text);
   }
 
-  $('cacheModal').hidden = false;
+  showAnim($('cacheModal'), 'is-out');
 }
 
 function closeCacheModal() {
-  $('cacheModal').hidden = true;
+  hideAnim($('cacheModal'), 'is-out');
 }
 
 async function doClearCache() {
@@ -2798,6 +3059,16 @@ loadStorage();
 
 // 没勾「渐进切入」时，时长框一开始就该是灰的
 syncFadeUI();
+
+// 恢复上次的全局开关（试听节拍声 / 导出节拍声）
+restoreGlobalToggles();
+
+// 触屏设备（手机/平板）没有「拖拽」这回事，上传区文案换成点击的说法。
+// 只改文字不动结构 —— JS 对 dropzone 的依赖只有 .big/.sub 这两个钩子。
+if (window.matchMedia && matchMedia('(pointer: coarse)').matches) {
+  const big = $('dropzone').querySelector('.big');
+  if (big) big.textContent = '点这里选择音频文件';
+}
 
 /* 调试出口：把内部状态与渲染函数挂到 window，
    便于本地预览、截图与排查问题（不影响正常使用）。 */
