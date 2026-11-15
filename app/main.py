@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, audio, config, store, update
+from . import __version__, apple_music, audio, config, store, update
 
 # 预热进度。打包版首次运行要现场编译 numba，可能要一两分钟；
 # 记下状态，前端才能在等待期间说清「为什么慢」。
@@ -741,6 +742,232 @@ async def download(name: str, as_name: str | None = None):
         ".zip": "application/zip",
     }.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=as_name or path.name)
+
+
+# --------------------------------------------------------------------------
+# 在线音源（Apple Music）
+# --------------------------------------------------------------------------
+
+
+class AppleSearchRequest(BaseModel):
+    term: str = Field(..., min_length=1, max_length=200, description="歌名/歌手/专辑关键词")
+    limit: int = Field(25, ge=1, le=50)
+
+
+class AppleImportRequest(BaseModel):
+    """按搜索结果里那条的完整 URL 导入。
+
+    用完整 URL 而不是裸 song id：Apple 的单曲 URL 带 ``?i=<id>``，
+    缺了它就变成「整张专辑」，下载器会下一堆歌回来。
+    """
+
+    url: str = Field(..., min_length=1, max_length=2000)
+    name: str | None = Field(None, max_length=300, description="展示用名字，缺省用曲名")
+
+
+class AppleCookiesRequest(BaseModel):
+    # 两种来源二选一：粘贴文本，或传一个本地文件路径
+    text: str | None = Field(None, max_length=200_000)
+    path: str | None = Field(None, max_length=2000)
+
+
+class AppleSettingsRequest(BaseModel):
+    storefront: str | None = Field(None, max_length=10)
+    language: str | None = Field(None, max_length=20)
+
+
+class AppleWvdRequest(BaseModel):
+    # 二选一：传本地路径（开发/高级用法），或传 base64 内容（浏览器只能用这条）
+    path: str | None = Field(None, max_length=2000)
+    data: str | None = Field(None, max_length=20_000_000)
+    name: str | None = Field(None, max_length=300)
+
+
+def _apple_guard(exc: Exception) -> HTTPException:
+    """把 apple_music 抛的业务异常翻译成 4xx，而不是一律 500。"""
+    if isinstance(exc, apple_music.AppleMusicError):
+        return HTTPException(400, str(exc))
+    return HTTPException(500, f"意外错误：{exc}")
+
+
+@app.get("/api/apple/status")
+async def apple_status(force: bool = False) -> dict:
+    """凭证状态：有没有 cookies、能不能用、有没有订阅、用的哪份 CDM。
+
+    ``force=true`` 跳过 30 秒缓存 —— 用户刚保存完 cookies 时会要求立刻复核。
+    """
+    try:
+        return await run_in_threadpool(apple_music.account_status, force)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+
+@app.post("/api/apple/search")
+async def apple_search(req: AppleSearchRequest) -> dict:
+    """按歌名搜索。**不需要 cookies**，没配凭证也能用。"""
+    try:
+        return await run_in_threadpool(apple_music.search, req.term, req.limit)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+
+@app.post("/api/apple/import")
+async def apple_import(req: AppleImportRequest) -> dict:
+    """下载一首歌的完整音源，并直接走一遍现有的入库链路。
+
+    做法上刻意**复用** ``_ingest_one``：下载产物在服务端落成一个临时
+    ``UploadFile`` 兼容对象，塞进同一条「落盘 → 探测 → 转 wav → 检测节拍」
+    链路。这样导入的歌曲和手动上传的歌曲在系统里完全等价，
+    变速/试听/导出全都不用改。
+    """
+    cookies_ok = await run_in_threadpool(apple_music.cookies_ready)
+    if not cookies_ok:
+        raise HTTPException(400, "还没有配置 cookies，无法下载完整音源")
+
+    try:
+        downloaded = await run_in_threadpool(
+            apple_music.download_song, req.url
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+    shown = (req.name or downloaded.stem).strip() or downloaded.stem
+    try:
+        local_path = await run_in_threadpool(apple_music.adopt, downloaded, shown)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+    handle = _LocalFileHandle(local_path, f"{shown}{local_path.suffix}")
+    try:
+        record = await _ingest_one(handle)
+    except HTTPException:
+        store.safe_unlink(local_path)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        store.safe_unlink(local_path)
+        raise HTTPException(500, f"入库失败：{exc}") from exc
+
+    return {"ok": True, "data": record, "source": "apple-music"}
+
+
+class _LocalFileHandle:
+    """让磁盘上的一个文件**看起来像** ``UploadFile``。
+
+    ``_ingest_one`` 只用到 ``filename`` 和 ``read(n)`` 两样东西，
+    所以这里只需要实现它们，不必真的构造 starlette 的对象。
+    顺带把 ``size`` 属性也补上，语义更直白。
+    """
+
+    __slots__ = ("filename", "path", "_handle")
+
+    def __init__(self, path: Path, filename: str) -> None:
+        self.path = Path(path)
+        self.filename = filename
+        self._handle = None
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._handle is None:
+            self._handle = self.path.open("rb")
+        return self._handle.read(size)
+
+    async def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    @property
+    def size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+
+@app.post("/api/apple/cookies")
+async def apple_save_cookies(req: AppleCookiesRequest) -> dict:
+    """保存 cookies：支持「粘贴文本」和「本地文件路径」两种来源。"""
+    try:
+        if req.path:
+            result = await run_in_threadpool(
+                apple_music.save_cookies_from_file, Path(req.path)
+            )
+        elif req.text:
+            result = await run_in_threadpool(apple_music.save_cookies, req.text)
+        else:
+            raise HTTPException(400, "请粘贴 cookies 内容，或选择一个 cookies.txt 文件")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+    # 存完立刻复核一次，界面能直接显示「有效 / 无订阅 / 无效」
+    status = await run_in_threadpool(apple_music.account_status, True)
+    return {**result, "status": status}
+
+
+@app.delete("/api/apple/cookies")
+async def apple_clear_cookies() -> dict:
+    try:
+        result = await run_in_threadpool(apple_music.clear_cookies)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.post("/api/apple/wvd")
+async def apple_save_wvd(req: AppleWvdRequest) -> dict:
+    """保存用户自备的 Widevine CDM。不传就继续用内置那份。"""
+    if req.data:
+        try:
+            raw = base64.b64decode(req.data, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"CDM 内容无法解码：{exc}") from exc
+        if not raw:
+            raise HTTPException(400, "CDM 文件是空的")
+        # 简单校验：Widevine device 文件以 protobuf 字段 1 (0x0A) 起头
+        if len(raw) < 64:
+            raise HTTPException(400, "这不像一个有效的 .wvd 文件（内容太短）")
+        try:
+            config.WVD_FILE.write_bytes(raw)
+        except OSError as exc:
+            raise HTTPException(500, f"保存失败：{exc}") from exc
+        result = {"saved": True, "size": len(raw)}
+    elif req.path:
+        try:
+            result = await run_in_threadpool(apple_music.save_wvd, Path(req.path))
+        except Exception as exc:  # noqa: BLE001
+            raise _apple_guard(exc) from exc
+    else:
+        raise HTTPException(400, "请提供 .wvd 文件内容或路径")
+
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.delete("/api/apple/wvd")
+async def apple_clear_wvd() -> dict:
+    try:
+        result = await run_in_threadpool(apple_music.clear_wvd)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.get("/api/apple/settings")
+async def apple_get_settings() -> dict:
+    return {"settings": config.load_settings()}
+
+
+@app.post("/api/apple/settings")
+async def apple_save_settings(req: AppleSettingsRequest) -> dict:
+    """改地区/语言。改完要复核凭证 —— 换地区等于换一套 catalog。"""
+    try:
+        saved = await run_in_threadpool(
+            config.save_settings, req.model_dump(exclude_none=True)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, str(exc)) from exc
+    apple_music._invalidate_status()
+    return {"settings": saved, "status": await run_in_threadpool(apple_music.account_status, True)}
 
 
 # --------------------------------------------------------------------------

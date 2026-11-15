@@ -43,6 +43,66 @@
       </div>
       <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" multiple hidden>
 
+      <!-- ===== 在线音源：搜歌直接下载完整音源 =====
+           和上面拖拽上传是**平级**的两条入口，产物殊途同归：
+           下载完一样进歌曲库，后续测速/变速/导出完全一致。 -->
+      <section class="side-card am-card" id="amCard">
+        <div class="side-head">
+          <h2>搜歌下载</h2>
+          <span class="am-dot" id="amDot" title="音源状态"></span>
+        </div>
+        <div class="side-hint" id="amHint">
+          从 Apple Music 搜索并下载完整音源。需要在本机配置 cookies（设置里）。
+        </div>
+
+        <div class="am-search">
+          <input class="am-input" id="amSearchInput" type="search"
+                 placeholder="歌名 / 歌手，回车搜索" autocomplete="off">
+          <button class="btn ghost am-go" id="amSearchBtn" type="button">搜索</button>
+        </div>
+
+        <div class="am-results" id="amResults" hidden></div>
+
+        <div class="am-config" id="amConfig">
+          <div class="am-config-head">
+            <span>音源设置</span>
+            <button class="am-link" id="amConfigToggle" type="button">展开</button>
+          </div>
+          <div class="am-config-body" id="amConfigBody" hidden>
+            <label class="am-label">cookies（粘贴文本，或从文件读）</label>
+            <textarea class="am-textarea" id="amCookiesText" rows="3"
+                      placeholder="直接粘贴 cookies.txt 的全部内容，或下面选择文件"></textarea>
+            <div class="am-row">
+              <button class="btn ghost am-mini" id="amCookiesFileBtn" type="button">选择 cookies.txt</button>
+              <button class="btn ghost am-mini" id="amCookiesSaveBtn" type="button">保存 cookies</button>
+              <button class="btn ghost am-mini" id="amCookiesClearBtn" type="button">清除</button>
+            </div>
+            <input type="file" id="amCookiesFile" accept=".txt,text/plain" hidden>
+
+            <label class="am-label">Widevine CDM（可不填，默认用内置）</label>
+            <div class="am-row">
+              <button class="btn ghost am-mini" id="amWvdFileBtn" type="button">选择 .wvd</button>
+              <button class="btn ghost am-mini" id="amWvdClearBtn" type="button">恢复内置</button>
+              <span class="am-note" id="amWvdNote">内置</span>
+            </div>
+            <input type="file" id="amWvdFile" accept=".wvd" hidden>
+
+            <label class="am-label">地区（影响能搜到/下载到什么）</label>
+            <select class="am-select" id="amStorefront">
+              <option value="cn">中国大陆 cn</option>
+              <option value="us">美国 us</option>
+              <option value="jp">日本 jp</option>
+              <option value="hk">香港 hk</option>
+              <option value="tw">台湾 tw</option>
+              <option value="sg">新加坡 sg</option>
+              <option value="gb">英国 gb</option>
+            </select>
+
+            <div class="am-status" id="amStatus">尚未检查</div>
+          </div>
+        </div>
+      </section>
+
       <section class="side-card" id="listCard" hidden>
         <div class="side-head">
           <h2>歌曲库</h2>

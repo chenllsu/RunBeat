@@ -3070,6 +3070,360 @@ if (window.matchMedia && matchMedia('(pointer: coarse)').matches) {
   if (big) big.textContent = '点这里选择音频文件';
 }
 
+/* ==========================================================================
+ * 在线音源（Apple Music）
+ *
+ * 和拖拽上传是**平级**的两条入口：下载完拿到的是和 /api/upload 完全一样的
+ * record，所以直接塞进 state.files 就能被现有的测速/变速/导出流程接管。
+ * 这里只负责「搜索 → 选择 → 下载入库」这一段，不碰任何音频处理逻辑。
+ * ========================================================================== */
+
+const AM = {
+  results: [],        // 当前搜索结果
+  busy: false,        // 搜索中
+  importing: -1,      // 正在下载的结果下标（-1 = 没有）
+  status: null,       // /api/apple/status 的最近一次结果
+};
+
+/* 把新入库的一首歌追加进歌曲库并切过去。逻辑与 handleFiles 里成功那一段一致，
+ * 抽出来是为了两处行为完全相同（勾选继承、自动进编辑器）。 */
+function addImportedTrack(record) {
+  if (state.files.length >= MAX_BATCH) {
+    toast(`列表里已经有 ${MAX_BATCH} 首了，先清掉一些再添加`, 'error');
+    return false;
+  }
+
+  const row = state.files.length;
+  state.files.push({
+    ...record,
+    params: defaultParams(record),
+    checked: Prefs.getChecked(record.name ?? '') ?? true,
+    status: 'ok',
+  });
+
+  // 只有当前没在编辑别的歌时才自动切过去，避免打断用户手头的活
+  if (state.current < 0) switchTo(row);
+  renderFileList();
+  return true;
+}
+
+async function amApi(path, options = {}) {
+  const res = await fetch(path, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `请求失败（HTTP ${res.status}）`);
+  return data;
+}
+
+/* --- 状态 --- */
+
+function amRenderStatus(st) {
+  AM.status = st;
+  const dot = $('amDot');
+  const hint = $('amHint');
+  const line = $('amStatus');
+  const note = $('amWvdNote');
+
+  if (note) note.textContent = st.wvd === 'custom' ? '自定义' : '内置';
+
+  const ready = !!st.ready && !!st.subscription;
+  dot.className = 'am-dot ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
+  dot.title = st.message || '';
+
+  if (ready) {
+    hint.textContent = '搜歌并下载完整音源。凭证有效，可以下载。';
+  } else if (!st.cookies) {
+    hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面配置 cookies。';
+  } else {
+    hint.textContent = 'cookies 已配置，但当前账号还不能下载（见下方状态）。';
+  }
+
+  if (line) {
+    line.textContent = st.message || '';
+    line.className = 'am-status ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
+  }
+
+  const sf = $('amStorefront');
+  if (sf && st.storefront && sf.value !== st.storefront) sf.value = st.storefront;
+}
+
+async function amRefreshStatus(force = false) {
+  try {
+    const st = await amApi(`/api/apple/status${force ? '?force=true' : ''}`);
+    amRenderStatus(st);
+  } catch (err) {
+    const line = $('amStatus');
+    if (line) {
+      line.textContent = `无法读取音源状态：${err.message}`;
+      line.className = 'am-status off';
+    }
+  }
+}
+
+/* --- 搜索 --- */
+
+function amRenderResults() {
+  const box = $('amResults');
+  if (!AM.results.length) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+
+  box.hidden = false;
+  box.innerHTML = AM.results
+    .map((it, i) => {
+      const busy = AM.importing === i;
+      const art = it.artwork
+        ? `<img class="am-art" src="${escapeHtml(it.artwork)}" alt="" loading="lazy">`
+        : '<div class="am-art am-art-empty"></div>';
+      const dur = it.duration ? formatClock(it.duration) : '';
+      return `<div class="am-row-item" data-i="${i}">
+        ${art}
+        <div class="am-meta">
+          <div class="am-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+          <div class="am-sub" title="${escapeHtml(it.album)}">${escapeHtml(it.artist)}${
+            it.album ? ' · ' + escapeHtml(it.album) : ''
+          }</div>
+        </div>
+        <span class="am-dur">${dur}</span>
+        <button class="btn ghost am-pick" type="button" data-i="${i}" ${
+          busy ? 'disabled' : ''
+        }>${busy ? '下载中…' : '下载'}</button>
+      </div>`;
+    })
+    .join('');
+}
+
+async function amSearch() {
+  const term = $('amSearchInput').value.trim();
+  if (!term) {
+    toast('先输入歌名或歌手', 'warn');
+    $('amSearchInput').focus();
+    return;
+  }
+  if (AM.busy) return;
+
+  AM.busy = true;
+  setBtnLoading($('amSearchBtn'), true, '搜索中…');
+  try {
+    const data = await amApi('/api/apple/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ term }),
+    });
+    AM.results = data.items || [];
+    amRenderResults();
+    if (!AM.results.length) toast('没搜到，换个关键词或换个地区试试', 'warn');
+  } catch (err) {
+    toast(`搜索失败：${err.message}`, 'error');
+  } finally {
+    AM.busy = false;
+    setBtnLoading($('amSearchBtn'), false);
+  }
+}
+
+/* --- 下载入库 --- */
+
+async function amImport(index) {
+  const it = AM.results[index];
+  if (!it || AM.importing >= 0) return;
+
+  if (!AM.status || !AM.status.cookies) {
+    toast('还没有配置 cookies，先在「音源设置」里填一下', 'warn');
+    $('amConfigBody').hidden = false;
+    $('amConfigToggle').textContent = '收起';
+    return;
+  }
+
+  AM.importing = index;
+  amRenderResults();
+
+  const say = (msg) => {
+    const line = $('amStatus');
+    if (line) line.textContent = msg;
+  };
+  say(`正在下载《${it.name}》…`);
+
+  try {
+    const data = await amApi('/api/apple/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: it.url, name: `${it.artist} - ${it.name}` }),
+    });
+    const record = data.data;
+    if (addImportedTrack(record)) {
+      toast(`《${it.name}》已加入歌曲库`, 'info');
+      say(
+        `已导入《${record.name}》，原曲 ${Math.round(record.detected_bpm)} BPM —— ` +
+          '右侧可直接设步频'
+      );
+    }
+  } catch (err) {
+    toast(`下载失败：${err.message}`, 'error');
+    say(`下载失败：${err.message}`);
+    // 失败多半是凭证问题，顺手复核一次状态，让红绿点说真话
+    amRefreshStatus(true);
+  } finally {
+    AM.importing = -1;
+    amRenderResults();
+  }
+}
+
+/* --- 凭证配置 --- */
+
+function amToggleConfig() {
+  const body = $('amConfigBody');
+  const btn = $('amConfigToggle');
+  const open = body.hidden;
+  body.hidden = !open;
+  btn.textContent = open ? '收起' : '展开';
+}
+
+async function amSaveCookiesText() {
+  const text = $('amCookiesText').value.trim();
+  if (!text) {
+    toast('先粘贴 cookies 内容，或选择 cookies.txt', 'warn');
+    return;
+  }
+  await amSaveCookies({ text });
+}
+
+async function amSaveCookies(payload) {
+  setBtnLoading($('amCookiesSaveBtn'), true, '保存中…');
+  try {
+    const data = await amApi('/api/apple/cookies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    amRenderStatus(data.status);
+    toast(
+      data.status.ready && data.status.subscription
+        ? 'cookies 已保存，凭证有效'
+        : 'cookies 已保存，但账号还不能下载（见下方状态）',
+      data.status.subscription ? 'info' : 'warn'
+    );
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'error');
+  } finally {
+    setBtnLoading($('amCookiesSaveBtn'), false);
+  }
+}
+
+async function amClearCookies() {
+  try {
+    const data = await amApi('/api/apple/cookies', { method: 'DELETE' });
+    amRenderStatus(data.status);
+    $('amCookiesText').value = '';
+    toast('cookies 已清除', 'info');
+  } catch (err) {
+    toast(`清除失败：${err.message}`, 'error');
+  }
+}
+
+/* 选文件走浏览器的原生 <input type=file>。
+ * 这里只拿文件名交给后端读 —— 桌面版本机同进程，后端读得到；
+ * 也顺手把内容读进 textarea，用户能看见自己选了什么。 */
+async function amPickFile(inputId, handler) {
+  const input = $(inputId);
+  input.value = '';
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    await handler(file);
+  };
+  input.click();
+}
+
+async function amSaveStorefront(value) {
+  try {
+    const data = await amApi('/api/apple/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storefront: value }),
+    });
+    amRenderStatus(data.status);
+    AM.results = [];
+    amRenderResults();
+    toast(`地区已切到 ${value}，重新搜索即可`, 'info');
+  } catch (err) {
+    toast(`切换地区失败：${err.message}`, 'error');
+  }
+}
+
+function amBind() {
+  const searchInput = $('amSearchInput');
+  const searchBtn = $('amSearchBtn');
+  if (!searchInput || !searchBtn) return;   // 页面结构变了就安静跳过，不炸整页
+
+  searchBtn.addEventListener('click', amSearch);
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      amSearch();
+    }
+  });
+
+  $('amResults').addEventListener('click', (e) => {
+    const btn = e.target.closest('.am-pick');
+    if (btn) {
+      amImport(Number(btn.dataset.i));
+    }
+  });
+
+  $('amConfigToggle').addEventListener('click', amToggleConfig);
+  $('amCookiesSaveBtn').addEventListener('click', amSaveCookiesText);
+  $('amCookiesClearBtn').addEventListener('click', amClearCookies);
+  $('amCookiesFileBtn').addEventListener('click', () =>
+    amPickFile('amCookiesFile', async (file) => {
+      const text = await file.text();
+      $('amCookiesText').value = text;
+      // 直接把内容发过去，绕开「后端能不能读到这个路径」的问题
+      await amSaveCookies({ text });
+    })
+  );
+
+  $('amWvdFileBtn').addEventListener('click', () =>
+    amPickFile('amWvdFile', async (file) => {
+      // .wvd 是二进制证书，前端不解析，只把字节交给后端落盘。
+      // 走 base64 而不是本地路径：浏览器拿不到真实路径，后端也不必相信它。
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let binary = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < buf.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
+      }
+      try {
+        const data = await amApi('/api/apple/wvd', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: btoa(binary), name: file.name }),
+        });
+        amRenderStatus(data.status);
+        toast('自定义 CDM 已保存', 'info');
+      } catch (err) {
+        toast(`保存 CDM 失败：${err.message}`, 'error');
+      }
+    })
+  );
+
+  $('amWvdClearBtn').addEventListener('click', async () => {
+    try {
+      const data = await amApi('/api/apple/wvd', { method: 'DELETE' });
+      amRenderStatus(data.status);
+      toast('已恢复使用内置 CDM', 'info');
+    } catch (err) {
+      toast(`操作失败：${err.message}`, 'error');
+    }
+  });
+
+  $('amStorefront').addEventListener('change', (e) => amSaveStorefront(e.target.value));
+
+  amRefreshStatus();
+}
+
+amBind();
+
 /* 调试出口：把内部状态与渲染函数挂到 window，
    便于本地预览、截图与排查问题（不影响正常使用）。 */
 window.__runbeat = {
