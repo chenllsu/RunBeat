@@ -1907,28 +1907,90 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 .am-pick { flex: 0 0 auto; padding: 5px 10px; font-size: 11.5px; }
 
-/* --- 设置区 --- */
+/* --- cookies 前置区块 ---
+ * 这是下载的必要条件，必须一直可见。配好且可用后（.is-set）才收成一行，
+ * 省出空间给搜索结果。 */
 
-.am-config { margin-top: 10px; flex: 0 0 auto; }
+.am-cookies {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
+/* 已配好且可用：折叠成「标题 + 清除」一行，免得长期占地方 */
+.am-cookies.is-set .am-cookies-hint,
+.am-cookies.is-set .am-textarea {
+  display: none;
+}
+
+.am-cookies-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+}
+
+.am-cookies-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.am-cookies-state {
+  font-size: 11px;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.am-cookies-state.ok { color: var(--accent); }
+.am-cookies-state.warn { color: var(--warn); }
+.am-cookies-state.off { color: var(--dim); }
+
+.am-cookies-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+/* --- 高级设置（可折叠）--- */
+
+.am-config { margin-top: 8px; flex: 0 0 auto; }
 
 .am-config-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 11.5px;
-  color: var(--muted);
+  gap: 8px;
 }
 
+/* 折叠开关做成整行可点，比一个小链接好点得多 */
 .am-link {
   background: none;
   border: none;
-  color: var(--accent);
+  color: var(--muted);
   font-size: 11.5px;
   cursor: pointer;
-  padding: 2px 4px;
+  padding: 3px 0;
   border-radius: 4px;
+  text-align: left;
+  transition: color var(--dur-1) var(--ease);
 }
-.am-link:hover { background: rgba(var(--accent-rgb), .1); }
+.am-link:hover { color: var(--accent); }
+.am-link::before {
+  /* 用 CSS 转义写 ▸，保持源文件这一行是纯 ASCII ——
+     scripts/check_frontend.py 会用系统编码（GBK）打印可疑行，
+     源码里直接放这个符号会让检查脚本自己抛 UnicodeEncodeError。 */
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.am-link.is-open::before { transform: rotate(90deg); }
+.am-link.is-open { color: var(--accent); }
 
 .am-config-body {
   margin-top: 8px;
@@ -1962,6 +2024,19 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 .am-textarea:focus { outline: none; border-color: var(--accent); }
 
 .am-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* cookies 那三个按钮要挤在一行：左栏很窄，「选 cookies.txt」+「保存」+「清除」
+   一起放不下时会折行，看着像布局坏了。这里收紧内边距保证同行，字号不再缩小
+   （10.5px 在窄栏里已经糊成一团了）。 */
+.am-cookies .am-row { flex-wrap: nowrap; gap: 5px; }
+.am-cookies .am-row .am-mini {
+  padding: 6px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  min-width: 0;
+  /* 「选 cookies.txt」按内容占宽，另外两个按内容自适应 */
+  flex: 0 1 auto;
+}
 
 .am-mini { padding: 5px 9px; font-size: 11px; }
 

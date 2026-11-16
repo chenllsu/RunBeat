@@ -3122,6 +3122,8 @@ function amRenderStatus(st) {
   const hint = $('amHint');
   const line = $('amStatus');
   const note = $('amWvdNote');
+  const state = $('amCookiesState');
+  const block = $('amCookiesBlock');
 
   if (note) note.textContent = st.wvd === 'custom' ? '自定义' : '内置';
 
@@ -3129,10 +3131,26 @@ function amRenderStatus(st) {
   dot.className = 'am-dot ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
   dot.title = st.message || '';
 
+  // cookies 区块的状态行：一眼看出「配没配、能不能用」
+  if (state) {
+    if (ready) {
+      state.textContent = '✓ 已配置，凭证有效';
+      state.className = 'am-cookies-state ok';
+    } else if (st.cookies) {
+      state.textContent = '！已配置，但账号还不能下载';
+      state.className = 'am-cookies-state warn';
+    } else {
+      state.textContent = '还没有配置 —— 粘贴后点「保存」';
+      state.className = 'am-cookies-state off';
+    }
+  }
+  // 配好了就把整块收起来（省空间）；没配就展开，逼着用户看见这一步
+  if (block) block.classList.toggle('is-set', ready);
+
   if (ready) {
     hint.textContent = '搜歌并下载完整音源。凭证有效，可以下载。';
   } else if (!st.cookies) {
-    hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面配置 cookies。';
+    hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面粘贴 cookies。';
   } else {
     hint.textContent = 'cookies 已配置，但当前账号还不能下载（见下方状态）。';
   }
@@ -3229,9 +3247,14 @@ async function amImport(index) {
   if (!it || AM.importing >= 0) return;
 
   if (!AM.status || !AM.status.cookies) {
-    toast('还没有配置 cookies，先在「音源设置」里填一下', 'warn');
-    $('amConfigBody').hidden = false;
-    $('amConfigToggle').textContent = '收起';
+    toast('还没有配置 cookies，先在下面「第 1 步」里粘贴', 'warn');
+    const box = $('amCookiesBlock');
+    if (box) {
+      box.classList.remove('is-set');
+      box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      const ta = $('amCookiesText');
+      if (ta) ta.focus();
+    }
     return;
   }
 
@@ -3276,7 +3299,7 @@ function amToggleConfig() {
   const btn = $('amConfigToggle');
   const open = body.hidden;
   body.hidden = !open;
-  btn.textContent = open ? '收起' : '展开';
+  btn.classList.toggle('is-open', open);
 }
 
 async function amSaveCookiesText() {
