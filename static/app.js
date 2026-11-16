@@ -3131,7 +3131,7 @@ function amRenderStatus(st) {
   dot.className = 'am-dot ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
   dot.title = st.message || '';
 
-  // cookies 区块的状态行：一眼看出「配没配、能不能用」
+  // cookies 区块的状态行：一眼看出「配没配、能不能用」，并给下一步动作
   if (state) {
     if (ready) {
       state.textContent = '✓ 已配置，凭证有效';
@@ -3140,7 +3140,7 @@ function amRenderStatus(st) {
       state.textContent = '！已配置，但账号还不能下载';
       state.className = 'am-cookies-state warn';
     } else {
-      state.textContent = '还没有配置 —— 粘贴后点「保存」';
+      state.textContent = '未配置 · 登录 → 导出 → 粘贴';
       state.className = 'am-cookies-state off';
     }
   }
@@ -3397,6 +3397,17 @@ function amBind() {
   $('amConfigToggle').addEventListener('click', amToggleConfig);
   $('amCookiesSaveBtn').addEventListener('click', amSaveCookiesText);
   $('amCookiesClearBtn').addEventListener('click', amClearCookies);
+
+  // 展开「怎么拿到 cookies」后把它滚到可见：左栏窄，说明一撑开
+  // 下半截（输入框、保存按钮）就滑出视野了，用户会以为没东西可填。
+  const steps = $('amSteps');
+  if (steps) {
+    steps.addEventListener('toggle', () => {
+      if (steps.open) {
+        requestAnimationFrame(() => steps.scrollIntoView({ block: 'nearest' }));
+      }
+    });
+  }
   $('amCookiesFileBtn').addEventListener('click', () =>
     amPickFile('amCookiesFile', async (file) => {
       const text = await file.text();

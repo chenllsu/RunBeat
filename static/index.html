@@ -65,16 +65,48 @@
 
         <!-- cookies 是下载的**前置条件**，不能藏在折叠面板里。
              早先把它和 WVD/地区一起塞进「音源设置 ▸ 展开」，结果用户根本
-             找不到入口 —— 必备步骤必须一眼看见。 -->
+             找不到入口 —— 必备步骤必须一眼看见。
+             说明文字拆成带编号的步骤：用户卡住的从来不是「粘到哪」，
+             而是「cookies 从哪来」。 -->
         <div class="am-cookies" id="amCookiesBlock">
           <div class="am-cookies-head">
             <span class="am-cookies-title">第 1 步 · 配置 cookies</span>
             <span class="am-cookies-state" id="amCookiesState">未配置</span>
           </div>
-          <div class="am-cookies-hint">
-            用浏览器的 cookies 导出插件在 music.apple.com 下导出 cookies.txt，
-            然后把内容粘到下面。
-          </div>
+
+          <!-- 分步说明：默认**收起**。左栏只有 ~270px，三条说明展开会占掉
+               大半屏，把输入框和按钮挤到需要滚动才能看见。
+               点开是「怎么弄到 cookies」，收起时是一句话提示。 -->
+          <details class="am-steps" id="amSteps">
+            <summary>怎么拿到 cookies？（点开看三步）</summary>
+            <ol class="am-steps-list">
+              <li>
+                <b>在浏览器里登录</b> <code>music.apple.com</code>，
+                确认右上角是你的账号头像（没登录拿到的 cookies 无效）。
+              </li>
+              <li>
+                <b>装一个导出插件</b>，在 music.apple.com 页面点它导出：
+                <div class="am-steps-links">
+                  <a href="https://chromewebstore.google.com/detail/open-cookiestxt/gdocmgbfkjnnpapoeobnolbbkoibbcif"
+                     target="_blank" rel="noopener">Chrome / Edge：Open Cookies.txt</a>
+                  <a href="https://addons.mozilla.org/firefox/addon/export-cookies-txt/"
+                     target="_blank" rel="noopener">Firefox：Export Cookies</a>
+                </div>
+              </li>
+              <li>
+                <b>把导出的内容贴到下面</b>，点「保存」。
+                也可以直接点「选 cookies.txt」选那个文件。
+              </li>
+            </ol>
+            <div class="am-steps-tip">
+              ⚠️ cookies 会过期。如果之前能用、隔几天突然不行了，
+              多半是过期了，重新导出一次即可。
+              <br>
+              这些内容只存在你本机的 <code>data/cookies.txt</code>，
+              不会上传到任何地方。
+            </div>
+          </details>
+
           <textarea class="am-textarea" id="amCookiesText" rows="3"
                     placeholder="把 cookies.txt 的全部内容粘贴到这里"></textarea>
           <div class="am-row">

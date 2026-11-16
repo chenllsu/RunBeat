@@ -1924,7 +1924,7 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 }
 
 /* 已配好且可用：折叠成「标题 + 清除」一行，免得长期占地方 */
-.am-cookies.is-set .am-cookies-hint,
+.am-cookies.is-set .am-steps,
 .am-cookies.is-set .am-textarea {
   display: none;
 }
@@ -1953,6 +1953,82 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 .am-cookies-hint {
   font-size: 11px;
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+/* --- 分步说明（cookies 怎么来）---
+ * 左栏只有 ~270px 宽，编号列表必须紧凑：编号缩小、行高收紧、
+ * 链接单独成行，否则挤成一坨反而更难读。 */
+
+.am-steps {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  background: var(--bg);
+}
+
+.am-steps > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  list-style: none;
+  user-select: none;
+}
+/* 去掉默认三角，换成自己的小箭头，和「高级设置」保持一致 */
+.am-steps > summary::-webkit-details-marker { display: none; }
+.am-steps > summary::before {
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.am-steps[open] > summary::before { transform: rotate(90deg); }
+
+.am-steps-list {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.am-steps-list li { padding-left: 1px; }
+.am-steps-list li::marker { color: var(--accent); font-weight: 600; }
+
+/* code 出现在说明里，要能和正文区分但别太亮 */
+.am-steps code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 0 3px;
+  color: var(--text);
+}
+
+.am-steps-links {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.am-steps-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  word-break: break-all;
+}
+.am-steps-links a:hover { text-decoration: underline; }
+
+.am-steps-tip {
+  margin-top: 9px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--line-soft);
+  font-size: 10.5px;
   line-height: 1.6;
   color: var(--dim);
 }
