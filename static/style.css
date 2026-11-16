@@ -1817,11 +1817,31 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 /* 搜歌卡片：允许收缩（flex-basis auto 但可被压缩），否则它按内容撑到 290px 后
  * 会把下面的「歌曲库」挤成 0 高 —— 实测歌曲库整块消失就是这么来的。
- * 高度上限给得保守些：搜索结果和歌曲库都要看得见，谁也不能把对方挤没。 */
+ *
+ * 高度上限 + overflow 让**整张卡自己滚**：结果多的时候滚这张卡，
+ * 而不是把内部列表压扁（压扁会出现「只露半行」的怪状态）。
+ * padding-right 给滚动条留位，免得按钮被压在条下面。 */
 .am-card {
   flex: 0 1 auto;
   min-height: 0;
-  max-height: 38vh;
+  max-height: 42vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 8px;
+}
+
+/* 这张卡自己滚，滚动条也要跟全站一致（不然又是一条浅色系统条） */
+.am-card::-webkit-scrollbar { width: 10px; height: 10px; }
+.am-card::-webkit-scrollbar-track { background: transparent; }
+.am-card::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .1);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
+.am-card::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .24);
+  background-clip: padding-box;
 }
 
 /* 状态点：绿=可下载，黄=有 cookies 但不可用，灰=没配 */
@@ -1884,15 +1904,19 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   font-variant-numeric: tabular-nums;
 }
 
-/* 结果列表：自己滚，最多占一屏的一半，不把下面的设置挤走 */
+/* 结果列表：按内容自然高度，**不做内部滚动**。
+ *
+ * 早先给它设 max-height + overflow 想让它自己滚，结果左栏高度紧张时
+ * 它被压到只剩半行（列表里明明有 25 条却只露一条边）。现在改成
+ * 整张搜歌卡片自己滚，列表按实际条数撑开 —— 用户一滚就能看到所有结果，
+ * 不会出现「内容被压扁」这种看不懂的状态。
+ * 高度上限交给 .am-card 的 max-height 统一管。 */
 .am-results {
   margin-top: 10px;
-  max-height: 240px;
-  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  flex: 0 1 auto;
+  flex: 0 0 auto;
 }
 
 .am-row-item {
