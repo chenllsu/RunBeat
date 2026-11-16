@@ -23,6 +23,7 @@ const AM = {
   busy: false,        // 搜索中
   importing: -1,      // 正在下载的结果下标（-1 = 没有）
   status: null,       // /api/apple/status 的最近一次结果
+  statusPromise: null,// 正在进行的凭证状态请求（防重复，也供守卫 await）
   term: '',           // 当前搜索词（翻页要沿用）
   page: 1,            // 当前页码（1 起）
   pageSize: 12,       // 与后端 apple_music.PAGE_SIZE 保持一致
@@ -3148,8 +3149,11 @@ function amOpenView() {
   $('panel').hidden = true;
   document.body.classList.add('search-open');
 
-  // 第一次进来时把凭证状态拉一遍，让「音源设置」里的提示是准的
-  if (!AM.status) amRefreshStatus();
+  // 第一次进来时把凭证状态拉一遍，让「音源设置」里的提示是准的。
+  // 单例 Promise 防重复请求：搜索页里状态可能被多处触发，只打一次。
+  if (!AM.statusPromise) {
+    AM.statusPromise = amRefreshStatus().finally(() => { AM.statusPromise = null; });
+  }
   amRenderAll();
 
   const input = $('amSearchInput');
@@ -3271,7 +3275,7 @@ function amRenderAll() {
           }${it.album ? ' · ' + escapeHtml(it.album) : ''}</div>
         </div>
         <span class="sv-dur">${dur}</span>
-        <button class="btn ghost" type="button" ${busy ? 'disabled' : ''}>${btnLabel}</button>
+        <button class="btn ghost" type="button" data-i="${i}" ${busy ? 'disabled' : ''}>${btnLabel}</button>
         ${progressHtml}
       </div>`;
     })
@@ -3430,6 +3434,16 @@ async function amImport(index) {
   const it = AM.results[index];
   if (!it || AM.importing >= 0) return;
 
+  // 凭证守卫：状态还没加载完时**等一下再判**，不要直接拒绝。
+  // 竞态实测：点「搜歌下载」后 amOpenView 里的 amRefreshStatus 是异步的，
+  // 网络慢时用户搜完歌点下载，AM.status 还是 null —— 旧逻辑在这里直接
+  // return，表现为「点了下载没反应」，连提示都没有。
+  if (!AM.status && AM.statusPromise) {
+    await AM.statusPromise;
+  }
+  if (!AM.status) {
+    await amRefreshStatus();
+  }
   if (!AM.status || !AM.status.cookies) {
     toast('还没有配置 cookies，展开「音源设置」粘贴一下', 'warn');
     const box = $('svSettings');
