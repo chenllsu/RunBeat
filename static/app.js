@@ -3249,12 +3249,20 @@ function amRenderAll() {
 
   grid.innerHTML = AM.results
     .map((it, i) => {
-      const busy = AM.importing === i;
+      const task = AM.importing === i ? AM.task : null;
+      const busy = !!task;
       const art = it.artwork
         ? `<img class="sv-art" src="${escapeHtml(it.artwork)}" alt="" loading="lazy">`
         : '<div class="sv-art sv-art-empty"></div>';
       const dur = it.duration ? formatClock(it.duration) : '';
-      return `<div class="sv-card">
+      // 下载中的卡片：按钮变成百分比，底部嵌一条真实进度
+      const progressHtml = task
+        ? `<div class="sv-card-progress"><div style="width:${task.percent}%"></div></div>`
+        : '';
+      const btnLabel = busy
+        ? `${task.percent}%`
+        : '下载';
+      return `<div class="sv-card${busy ? ' importing' : ''}">
         ${art}
         <div class="sv-info">
           <div class="sv-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
@@ -3263,9 +3271,8 @@ function amRenderAll() {
           }${it.album ? ' · ' + escapeHtml(it.album) : ''}</div>
         </div>
         <span class="sv-dur">${dur}</span>
-        <button class="btn ghost" type="button" data-i="${i}" ${
-          busy ? 'disabled' : ''
-        }>${busy ? '下载中' : '下载'}</button>
+        <button class="btn ghost" type="button" ${busy ? 'disabled' : ''}>${btnLabel}</button>
+        ${progressHtml}
       </div>`;
     })
     .join('');
@@ -3308,6 +3315,64 @@ function amRenderPager() {
     .join('');
 }
 
+/* --- 进度条 ---
+ * 两种模式共用同一条顶部进度条：
+ *   indeterminate —— 搜索用。一次 HTTP 请求拿不到分步进度，
+ *                    流动的亮条 + 已用时秒数，不造假百分比。
+ *   determinate   —— 下载用。后端按阶段权重折算出真实 0~100%。 */
+let amSearchTimer = null;
+
+function amProgressStart(text, indeterminate) {
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (!bar) return;
+  bar.hidden = false;
+  bar.classList.toggle('indet', !!indeterminate);
+  if (indeterminate) {
+    // indeterminate 的宽度由 CSS 动画接管，这里清掉内联宽度
+    $('svProgressBar').style.width = '';
+  }
+  if (txt) {
+    txt.hidden = false;
+    txt.innerHTML = `<span class="spinner"></span>${escapeHtml(text)}`;
+  }
+  // 搜索计时：超过 2 秒后显示已用时，让「还在跑」这件事自己说话
+  if (amSearchTimer) clearInterval(amSearchTimer);
+  if (indeterminate) {
+    const started = Date.now();
+    amSearchTimer = setInterval(() => {
+      const sec = Math.round((Date.now() - started) / 1000);
+      const el = $('svProgressText');
+      if (el && sec >= 2) {
+        el.innerHTML = `<span class="spinner"></span>搜索中… 已用时 <b>${sec}</b> 秒`;
+      }
+    }, 500);
+  }
+}
+
+function amProgressSet(percent, detail) {
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (!bar) return;
+  bar.hidden = false;
+  bar.classList.remove('indet');
+  $('svProgressBar').style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  if (txt) {
+    txt.hidden = false;
+    txt.innerHTML = `<span class="spinner"></span>${
+      escapeHtml(detail || '处理中…')
+    } <span class="sv-pct"><b>${percent}%</b></span>`;
+  }
+}
+
+function amProgressDone() {
+  if (amSearchTimer) { clearInterval(amSearchTimer); amSearchTimer = null; }
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (bar) bar.hidden = true;
+  if (txt) { txt.hidden = true; txt.innerHTML = ''; }
+}
+
 /* --- 搜索 --- */
 
 async function amSearch(page = 1) {
@@ -3323,6 +3388,7 @@ async function amSearch(page = 1) {
   AM.busy = true;
   AM.term = term;
   setBtnLoading($('amSearchBtn'), true, '搜索中…');
+  amProgressStart(`搜索「${term}」中…`, true);
   amRenderPager();
 
   try {
@@ -3339,18 +3405,26 @@ async function amSearch(page = 1) {
     AM.page = data.page || page;
     AM.hasNext = !!data.has_next;
     AM.hasPrev = !!data.has_prev;
-    amRenderAll();
     if (!AM.results.length) toast(`没搜到「${term}」，换个关键词或地区试试`, 'warn');
   } catch (err) {
     toast(`搜索失败：${err.message}`, 'error');
   } finally {
     AM.busy = false;
     setBtnLoading($('amSearchBtn'), false);
+    amProgressDone();
     amRenderAll();
   }
 }
 
-/* --- 下载入库 --- */
+/* --- 下载入库 ---
+ * 接口改成任务制：POST 只拿 task_id，之后轮询进度。
+ * 进度显示两处：
+ *   - 顶部进度条（真实百分比 + 阶段说明）
+ *   - 被下载那张卡片底部嵌一条迷你进度条，按钮显示百分比
+ * 轮询间隔 800ms；任务超过 5 分钟视为卡死，提示用户。 */
+
+const AM_POLL_INTERVAL = 800;
+const AM_POLL_TIMEOUT = 5 * 60 * 1000;
 
 async function amImport(index) {
   const it = AM.results[index];
@@ -3368,30 +3442,89 @@ async function amImport(index) {
     return;
   }
 
-  AM.importing = index;
-  amRenderAll();
-
+  let taskId = '';
   try {
-    const data = await amApi('/api/apple/import', {
+    const resp = await amApi('/api/apple/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       // 歌名和歌手分开传，后端拼成「歌名-歌手」——
       // 前端拼的话样式一改就要两边一起动。
       body: JSON.stringify({ url: it.url, song: it.name, artist: it.artist }),
     });
-    const record = data.data;
-    if (addImportedTrack(record)) {
-      toast(`《${it.name}》已加入歌曲库`, 'info');
-      // 导入完直接切回编辑器，用户能立刻看到刚进来的那首
-      amCloseView();
-    }
+    taskId = resp.task_id;
   } catch (err) {
-    toast(`下载失败：${err.message}`, 'error');
-    // 失败多半是凭证问题，复核一次让提示说真话
+    toast(`提交下载失败：${err.message}`, 'error');
     amRefreshStatus(true);
-  } finally {
+    return;
+  }
+
+  AM.importing = index;
+  AM.task = { percent: 0, stage_label: '排队中', detail: '' };
+  amRenderAll();
+  amProgressSet(0, `《${it.name}》排队中…`);
+
+  const started = Date.now();
+  let lastStage = '';
+
+  const finish = (record, errMsg) => {
     AM.importing = -1;
+    AM.task = null;
+    amProgressDone();
     amRenderAll();
+    if (record) {
+      if (addImportedTrack(record)) {
+        toast(`《${it.name}》已加入歌曲库`, 'info');
+        amCloseView();   // 导入完切回编辑器，立刻看到刚进来的那首
+      }
+    } else {
+      toast(`下载失败：${errMsg}`, 'error');
+      amRefreshStatus(true);   // 失败多半是凭证问题，复核一次
+    }
+  };
+
+  // 轮询循环
+  while (true) {
+    await new Promise((r) => setTimeout(r, AM_POLL_INTERVAL));
+
+    let snap;
+    try {
+      snap = await amApi(`/api/apple/import/${taskId}`);
+    } catch (err) {
+      finish(null, err.message);
+      return;
+    }
+
+    if (Date.now() - started > AM_POLL_TIMEOUT) {
+      finish(null, '下载超时（超过 5 分钟），请检查网络后重试');
+      return;
+    }
+
+    // 阶段切换时把说明刷上去
+    if (snap.stage !== lastStage) {
+      lastStage = snap.stage;
+      amProgressSet(snap.percent, `${snap.stage_label}：${snap.detail || snap.title}`);
+    } else {
+      amProgressSet(snap.percent, snap.detail || snap.stage_label);
+    }
+
+    AM.task = { percent: snap.percent, stage_label: snap.stage_label, detail: snap.detail };
+    amRenderAll();
+
+    if (snap.status === 'done') {
+      // record 全文在主接口的内存表里；这里补一次拉取
+      try {
+        const full = await amApi('/api/apple/record/' + taskId);
+        finish(full.data, null);
+      } catch (err) {
+        // 拉不到 record（理论上不该发生），至少告诉用户成了
+        finish(null, '下载完成但读取结果失败，请重试');
+      }
+      return;
+    }
+    if (snap.status === 'error') {
+      finish(null, snap.error || '未知错误');
+      return;
+    }
   }
 }
 

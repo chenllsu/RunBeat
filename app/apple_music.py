@@ -30,6 +30,151 @@ MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 # 同时只跑一条下载：本机单用户，并发只会互相抢带宽，还让进度提示失真
 _download_lock = threading.Lock()
 
+# --------------------------------------------------------------------------
+# 下载任务表（进度上报）
+#
+# 下载一首歌要经历「初始化 → 解析 → 下载 → 保存 → BPM 分析」五步，全程
+# 20~60 秒。前端要进度条就必须能轮询 —— 所以下载不再塞在 HTTP 请求里同步
+# 等完，而是登记成任务丢后台线程，前端拿 task_id 轮询状态。
+#
+# 仅本机单用户：内存表即可，服务重启丢掉也无妨（前端本来就要刷新重试）；
+# 表项在任务结束（成功/失败）后保留 10 分钟供前端收尾读取，然后清掉。
+# --------------------------------------------------------------------------
+
+_tasks: dict[str, dict] = {}
+_tasks_lock = threading.Lock()
+
+# 任务完结后保留多久（秒），给前端留出收尾轮询的窗口
+_TASK_TTL = 600.0
+
+# 五个阶段的权重（加起来 = 100%）。BPM 分析在最前面测过要 2~4 秒，
+# 值得单独给一档，而不是混在「保存」里让进度条卡 90% 卡半天。
+STAGE_WEIGHTS: tuple[tuple[str, int], ...] = (
+    ("init", 5),      # 初始化（拿 token、建 API 客户端）
+    ("parse", 10),    # 解析歌曲链接
+    ("download", 55), # 下载音轨（大头，由 amdl 的字节级 progress 细分）
+    ("save", 10),     # 保存入库
+    ("analyze", 20),  # 转 wav + BPM 检测
+)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _task_cleanup_locked() -> None:
+    """清掉完结超时的任务。调用方必须已持有锁。"""
+    deadline = _now() - _TASK_TTL
+    for tid in [t for t, d in _tasks.items()
+                if d["status"] in ("done", "error") and d.get("ended_at", 0) < deadline]:
+        _tasks.pop(tid, None)
+
+
+def task_create(title: str) -> str:
+    """登记一个新下载任务，返回 task_id。"""
+    tid = uuid.uuid4().hex[:16]
+    with _tasks_lock:
+        _task_cleanup_locked()
+        _tasks[tid] = {
+            "task_id": tid,
+            "title": title,
+            "status": "pending",       # pending → running → done / error
+            "stage": "init",           # STAGE_WEIGHTS 里的键
+            "stage_label": "排队中",
+            "percent": 0,              # 0~100（整数，前端直接用）
+            "detail": "",              # 当前步骤的一句人话说明
+            "logs": [],                # 给用户看的日志行（倒序存，新的在前）
+            "created_at": _now(),
+            "ended_at": 0.0,
+            "error": "",
+            "record": None,            # 成功时放 _ingest_one 的返回
+        }
+    return tid
+
+
+def task_get(tid: str) -> dict | None:
+    with _tasks_lock:
+        t = _tasks.get(tid)
+        return dict(t) if t else None
+
+
+def task_snapshot(tid: str) -> dict | None:
+    """给前端的精简快照：不带 record 全文，成功时带 file_id/name。"""
+    t = task_get(tid)
+    if not t:
+        return None
+    snap = {
+        "task_id": t["task_id"],
+        "title": t["title"],
+        "status": t["status"],
+        "stage": t["stage"],
+        "stage_label": t["stage_label"],
+        "percent": t["percent"],
+        "detail": t["detail"],
+        "logs": t["logs"][:5],
+    }
+    if t["status"] == "done" and t["record"]:
+        snap["data"] = {
+            "file_id": t["record"].get("file_id"),
+            "name": t["record"].get("name"),
+        }
+    if t["status"] == "error":
+        snap["error"] = t["error"]
+    return snap
+
+
+def task_update(tid: str, **fields) -> None:
+    with _tasks_lock:
+        t = _tasks.get(tid)
+        if t is None:
+            return
+        t.update(fields)
+
+
+def task_log(tid: str, msg: str) -> None:
+    """追加一行用户可读的日志（新的在前，最多留 40 行）。"""
+    with _tasks_lock:
+        t = _tasks.get(tid)
+        if t is None:
+            return
+        t["logs"] = [msg, *t["logs"]][:40]
+
+
+def task_stage(tid: str, stage: str, detail: str = "", base_percent: int | None = None) -> None:
+    """推进到某个阶段。
+
+    ``base_percent`` 是该阶段的起始百分比（从 STAGE_WEIGHTS 累加得出）；
+    不传就按权重表算。detail 是当前步骤的人话说明。
+    """
+    label_map = dict(STAGE_WEIGHTS)
+    if stage not in label_map:
+        return
+    if base_percent is None:
+        acc = 0
+        for key, weight in STAGE_WEIGHTS:
+            if key == stage:
+                break
+            acc += weight
+        base_percent = acc
+
+    task_update(
+        tid,
+        stage=stage,
+        stage_label={"init": "准备中", "parse": "解析歌曲", "download": "下载音源",
+                     "save": "保存文件", "analyze": "分析节拍"}.get(stage, stage),
+        percent=base_percent,
+        detail=detail or "",
+    )
+
+
+def task_progress(tid: str, stage_base: int, stage_weight: int, done: int, total: int) -> None:
+    """下载阶段的字节级进度：把 amdl 的 (completed, total) 折算到全局百分比。"""
+    if total <= 0:
+        return
+    frac = max(0.0, min(1.0, done / total))
+    percent = int(stage_base + stage_weight * frac)
+    task_update(tid, percent=percent)
+
 # 上一次探测到的「可用性」结果缓存，避免每次点开搜索都重新握手
 _status_cache: dict = {"at": 0.0, "data": None}
 _STATUS_TTL = 30.0
@@ -667,3 +812,137 @@ def _humanize(exc: Exception) -> str:
     if "connect" in low:
         return "网络连接失败，请检查网络或代理设置"
     return text[:220]
+
+
+# --------------------------------------------------------------------------
+# 后台下载任务：下载 + 入库一条龙，全程可轮询进度
+# --------------------------------------------------------------------------
+
+def run_import_task(
+    tid: str,
+    url: str,
+    song_name: str,
+    artist: str,
+    ingest_fn,
+) -> None:
+    """后台线程入口：完整跑一遍「下载 → 保存 → 入库」，实时更新任务状态。
+
+    ``ingest_fn`` 是 main._ingest_one（避免循环 import，由调用方注入）。
+
+    五个阶段与百分比（STAGE_WEIGHTS 的累加）：
+        init 0-5 → parse 5-15 → download 15-70 → save 70-80 → analyze 80-100
+    """
+    stage_base = {"init": 0, "parse": 5, "download": 15, "save": 70, "analyze": 80}
+
+    def say(msg: str) -> None:
+        task_log(tid, msg)
+
+    def go_stage(stage: str, detail: str) -> None:
+        task_stage(tid, stage, detail, base_percent=stage_base[stage])
+
+    try:
+        task_update(tid, status="running")
+        go_stage("init", "连接 Apple Music…")
+
+        if not cookies_ready():
+            raise AppleMusicError("还没有配置 cookies，无法下载完整音源")
+
+        go_stage("parse", f"解析《{song_name}》…")
+        say(f"开始：《{song_name}-{artist}》")
+
+        # ---- 下载 ----
+        #
+        # amdl 的 progress_callback 只在**每首**歌完成后回调一次 (n, total)，
+        # 单曲场景拿不到字节级进度 —— 这是 amdl 的设计，不是能改的。
+        # 所以下载段的进度用「日志关键字节点」推进：amdl 的日志顺序稳定
+        # （创建接口 → 接口就绪 → 下载中 → 完成），按节点跳 15→22→30→45，
+        # 节点之间不再编造数字 —— 配合前端显示的已用时，比假百分比诚实。
+        milestones = {
+            "creating applemusicbaseinterface": 22,
+            "applemusicinterface ready": 30,
+            'downloading "': 45,
+        }
+        reached: set[str] = set()
+
+        def on_log(msg: str) -> None:
+            say(msg)
+            low = msg.lower()
+            for key, pct in milestones.items():
+                if key in low and key not in reached:
+                    reached.add(key)
+                    task_update(tid, percent=pct, detail="下载音源…")
+
+        def on_progress(done: int, total: int) -> None:
+            # 单曲 = 完成时的一把 (1,1)：到这就把下载段收尾
+            task_update(tid, percent=68, detail="音源已取得，正在保存")
+
+        go_stage("download", "下载音源…")
+        downloaded = download_song(url, progress=on_progress, log=on_log)
+
+        # ---- 保存 ----
+        go_stage("save", "保存文件…")
+        shown = display_name(song_name, artist)
+        local_path = adopt(downloaded, shown)
+
+        # ---- BPM 分析入库 ----
+        go_stage("analyze", "分析节拍中…")
+        handle = _ImportHandle(local_path, shown)
+        # _ingest_one 是 async 的，而本函数跑在普通工作线程 ——
+        # 这里没有运行中的事件循环，直接 asyncio.run 开一个跑完即可。
+        import asyncio
+
+        record = asyncio.run(ingest_fn(handle))
+
+        task_update(
+            tid,
+            status="done",
+            percent=100,
+            stage="analyze",
+            stage_label="完成",
+            detail="已加入歌曲库",
+            record=record,
+            ended_at=_now(),
+        )
+        say(f"完成：{shown}（{record.get('detected_bpm', '?')} BPM）")
+
+    except BaseException as exc:  # noqa: BLE001 —— 后台线程必须自己兜住一切
+        msg = _humanize(exc) if isinstance(exc, AppleMusicError) else f"{exc}"
+        task_update(
+            tid,
+            status="error",
+            stage_label="失败",
+            detail=msg,
+            error=msg,
+            ended_at=_now(),
+        )
+        say(f"失败：{msg}")
+
+
+class _ImportHandle:
+    """给 ``_ingest_one`` 的轻量文件句柄（见 main._LocalFileHandle）。"""
+
+    __slots__ = ("filename", "display_name", "path", "_handle")
+
+    def __init__(self, path: Path, shown: str) -> None:
+        self.path = Path(path)
+        # filename 带扩展名只用于格式判断；display_name 是给人看的
+        self.filename = shown + self.path.suffix
+        self.display_name = shown
+        self._handle = None
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._handle is None:
+            self._handle = self.path.open("rb")
+        return self._handle.read(size)
+
+    async def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    @property
+    def size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0

@@ -824,50 +824,65 @@ async def apple_search(req: AppleSearchRequest) -> dict:
 
 @app.post("/api/apple/import")
 async def apple_import(req: AppleImportRequest) -> dict:
-    """下载一首歌的完整音源，并直接走一遍现有的入库链路。
+    """下载一首歌的完整音源并入库。
 
-    做法上刻意**复用** ``_ingest_one``：下载产物在服务端落成一个临时
-    ``UploadFile`` 兼容对象，塞进同一条「落盘 → 探测 → 转 wav → 检测节拍」
-    链路。这样导入的歌曲和手动上传的歌曲在系统里完全等价，
-    变速/试听/导出全都不用改。
+    下载全程 20~60 秒，同步等完会让前端干等还拿不到进度 —— 所以这里只
+    登记**任务**立刻返回 ``task_id``，真正的下载在后台线程跑，
+    前端拿 id 轮询 ``GET /api/apple/import/{task_id}``。
     """
     cookies_ok = await run_in_threadpool(apple_music.cookies_ready)
     if not cookies_ok:
         raise HTTPException(400, "还没有配置 cookies，无法下载完整音源")
 
-    try:
-        downloaded = await run_in_threadpool(
-            apple_music.download_song, req.url
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise _apple_guard(exc) from exc
-
-    # 显示名：优先「歌名-歌手」（新格式），退回调用方给的 name，最后用文件名
+    # 显示名：优先「歌名-歌手」（新格式），退回调用方给的 name
     if req.song:
         shown = apple_music.display_name(req.song, req.artist or "")
     else:
-        shown = (req.name or downloaded.stem).strip() or downloaded.stem
-        shown = apple_music.display_name(shown, "")
+        shown = apple_music.display_name(req.name or "未知曲目", "")
 
-    try:
-        local_path = await run_in_threadpool(apple_music.adopt, downloaded, shown)
-    except Exception as exc:  # noqa: BLE001
-        raise _apple_guard(exc) from exc
-
-    # filename 只用来判格式，显示名单独给 —— 界面上不该出现 .m4a
-    handle = _LocalFileHandle(
-        local_path, f"{shown}{local_path.suffix}", display_name=shown
+    tid = await run_in_threadpool(
+        apple_music.task_create, f"{shown}"
     )
-    try:
-        record = await _ingest_one(handle)
-    except HTTPException:
-        store.safe_unlink(local_path)
-        raise
-    except Exception as exc:  # noqa: BLE001
-        store.safe_unlink(local_path)
-        raise HTTPException(500, f"入库失败：{exc}") from exc
 
-    return {"ok": True, "data": record, "source": "apple-music"}
+    # 后台线程里跑完整链路；_ingest_one 注入进去避免循环 import。
+    # daemon=True：服务关闭时不被它拖住 —— 本机任务丢了重下就是。
+    worker = threading.Thread(
+        target=apple_music.run_import_task,
+        args=(tid, req.url, req.song or "", req.artist or "", _ingest_one),
+        daemon=True,
+    )
+    worker.start()
+
+    return {
+        "ok": True,
+        "task_id": tid,
+        "title": shown,
+        "status": "pending",
+        "source": "apple-music",
+    }
+
+
+@app.get("/api/apple/import/{task_id}")
+async def apple_import_status(task_id: str) -> dict:
+    """轮询下载任务进度。任务结束（done/error）后保留 10 分钟可查。"""
+    snap = await run_in_threadpool(apple_music.task_snapshot, task_id)
+    if snap is None:
+        raise HTTPException(404, "任务不存在或已过期")
+    return snap
+
+
+@app.get("/api/apple/record/{task_id}")
+async def apple_import_record(task_id: str) -> dict:
+    """任务成功后取完整的入库 record（含 file_id / defaults 等全部字段）。
+
+    与轮询接口分开：轮询高频，不该每次都拖着 record 全文跑。
+    """
+    t = await run_in_threadpool(apple_music.task_get, task_id)
+    if t is None:
+        raise HTTPException(404, "任务不存在或已过期")
+    if t["status"] != "done" or not t.get("record"):
+        raise HTTPException(409, "任务尚未完成")
+    return {"ok": True, "data": t["record"], "source": "apple-music"}
 
 
 class _LocalFileHandle:

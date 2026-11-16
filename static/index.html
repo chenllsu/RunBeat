@@ -114,6 +114,13 @@
            为什么放在右栏而不是左栏：搜索结果要横向铺开（三列 × 四行 = 12 首），
            挤在 266px 的侧栏里只能滚动，看着难受。 -->
       <div id="searchView" hidden>
+        <!-- 顶部进度条：搜索时是流动的细条（Apple 不给分步进度，做假百分比没意义），
+             下载时是真实的阶段进度（0~100%）。铺在搜索视图最顶端，宽屏一眼可见。 -->
+        <div class="sv-progress" id="svProgress" hidden>
+          <div class="sv-progress-bar" id="svProgressBar"></div>
+        </div>
+        <div class="sv-progress-text" id="svProgressText" hidden></div>
+
         <div class="sv-head">
           <h2>搜歌下载</h2>
           <span class="sv-count" id="svCount"></span>
