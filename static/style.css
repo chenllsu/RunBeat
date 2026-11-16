@@ -2208,6 +2208,226 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 .am-status.warn { color: var(--warn); }
 .am-status.off { color: var(--dim); }
 
+/* ==========================================================================
+ * 搜索视图（右栏整块切换）
+ * 点顶栏「搜歌下载」进入，占满编辑区 —— 结果三列 × 四行 = 12 首，纯翻页。
+ * ========================================================================== */
+
+#searchView {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 不撑满整屏：内容多高就多高，翻页器紧跟网格下面。
+     之前用 min-height:100% 把翻页器顶到了屏幕最底部，中间空一大片。 */
+}
+
+.sv-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.sv-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.sv-count { font-size: 11.5px; color: var(--dim); }
+.sv-spacer { flex: 1; }
+.sv-head .btn { padding: 6px 12px; font-size: 12px; }
+
+.sv-search {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.sv-search input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13.5px;
+  padding: 10px 13px;
+  transition: border-color var(--dur-1) var(--ease);
+}
+.sv-search input::placeholder { color: var(--dim); }
+.sv-search input:focus { outline: none; border-color: var(--accent); }
+
+.sv-search .btn { flex: 0 0 auto; padding: 10px 20px; }
+
+/* --- 音源设置（折叠） --- */
+
+.sv-settings {
+  flex: 0 0 auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.sv-settings > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sv-settings > summary::-webkit-details-marker { display: none; }
+.sv-settings > summary::before {
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.sv-settings[open] > summary::before { transform: rotate(90deg); }
+.sv-settings[open] > summary { color: var(--accent); margin-bottom: 10px; }
+
+.sv-set-block {
+  border-top: 1px solid var(--line-soft);
+  padding: 12px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sv-set-block:first-of-type { border-top: none; padding-top: 0; }
+
+.sv-set-title {
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sv-set-hint { font-size: 11px; color: var(--dim); line-height: 1.6; }
+
+/* 设置区比侧栏宽，说明文字可以更舒展 */
+.sv-settings .am-steps { max-width: 720px; }
+.sv-settings .am-textarea { max-width: 720px; min-height: 70px; }
+
+/* --- 结果网格 --- */
+
+.sv-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  flex: 1 1 auto;
+  align-content: start;
+}
+
+.sv-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color var(--dur-1) var(--ease);
+  animation: svIn var(--dur-3) var(--ease) both;
+  min-width: 0;
+}
+.sv-card:hover { border-color: var(--accent); }
+
+@keyframes svIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.sv-art {
+  width: 46px;
+  height: 46px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: var(--line-soft);
+}
+.sv-art-empty { border: 1px solid var(--line); }
+
+.sv-info { flex: 1; min-width: 0; }
+
+.sv-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sv-sub {
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.sv-dur {
+  font-size: 10.5px;
+  color: var(--dim);
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.sv-card .btn {
+  flex: 0 0 auto;
+  padding: 5px 11px;
+  font-size: 11.5px;
+}
+
+/* --- 翻页 --- */
+
+.sv-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 6px 0 2px;
+}
+
+.sv-pill {
+  min-width: 31px;
+  height: 31px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--dur-1) var(--ease);
+}
+.sv-pill:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.sv-pill:disabled { opacity: .35; cursor: not-allowed; }
+.sv-pill.on {
+  background: var(--grad);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.sv-pages { display: inline-flex; gap: 5px; }
+
+.sv-page-hint {
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-left: 4px;
+}
+
+.sv-empty {
+  padding: 60px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 12px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: .01ms !important;

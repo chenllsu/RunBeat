@@ -15,6 +15,22 @@ const CLIP_TAIL_SEC = 5.0;   // 改终点时从「终点前这么多秒」开始
 const MAX_BATCH = 20;   // 与后端 config.MAX_BATCH_FILES 保持一致
 const FADE_MAX = 3.0;   // 开头渐入时长上限（秒），与后端 config.MAX_FADE_SEC 保持一致
 
+/* 在线音源的状态容器。
+ * 放在文件顶部而不是跟着下面的实现走：initUI() 等早期函数要读 AM.open
+ * 判断「搜索视图是不是在前台」，声明太靠后会踩 const 的暂时性死区。 */
+const AM = {
+  results: [],        // 当前这一页的结果
+  busy: false,        // 搜索中
+  importing: -1,      // 正在下载的结果下标（-1 = 没有）
+  status: null,       // /api/apple/status 的最近一次结果
+  term: '',           // 当前搜索词（翻页要沿用）
+  page: 1,            // 当前页码（1 起）
+  pageSize: 12,       // 与后端 apple_music.PAGE_SIZE 保持一致
+  hasNext: false,
+  hasPrev: false,
+  open: false,        // 搜索视图是否在前台
+};
+
 const state = {
   track: null,
   sourceBpm: null,
@@ -1258,7 +1274,8 @@ function setDropzoneBusy(done, total, name) {
 function initUI() {
   const t = state.track;
   // 批量模式下上传区**不隐藏** —— 随时可以再拖几首进来（追加到列表末尾）。
-  $('panel').hidden = false;
+  // 搜索视图在前台时不要抢回来：用户正在挑歌，突然被切走会很突兀。
+  $('panel').hidden = !!AM.open;
   $('playerBar').hidden = false;   // 底部常驻播放条跟着编辑器一起出现
 
   const okList = state.files.filter((f) => f.status === 'ok');
@@ -3087,17 +3104,12 @@ if (window.matchMedia && matchMedia('(pointer: coarse)').matches) {
  * 和拖拽上传是**平级**的两条入口：下载完拿到的是和 /api/upload 完全一样的
  * record，所以直接塞进 state.files 就能被现有的测速/变速/导出流程接管。
  * 这里只负责「搜索 → 选择 → 下载入库」这一段，不碰任何音频处理逻辑。
+ *
+ * 界面上占的是**右栏整块**（#searchView），不是左栏那张窄卡片 ——
+ * 结果要三列铺开（12 首/页），塞在 266px 的侧栏里只能滚动，用着难受。
  * ========================================================================== */
 
-const AM = {
-  results: [],        // 当前搜索结果（翻页时累积）
-  busy: false,        // 搜索中
-  importing: -1,      // 正在下载的结果下标（-1 = 没有）
-  status: null,       // /api/apple/status 的最近一次结果
-  term: '',           // 本次搜索用的关键词（翻页要用同一个）
-  hasMore: false,     // 还有没有下一页
-  loadingMore: false,
-};
+/* AM 状态容器在前面（文件顶部）声明，这里只管行为。 */
 
 /* 把新入库的一首歌追加进歌曲库并切过去。逻辑与 handleFiles 里成功那一段一致，
  * 抽出来是为了两处行为完全相同（勾选继承、自动进编辑器）。 */
@@ -3128,24 +3140,46 @@ async function amApi(path, options = {}) {
   return data;
 }
 
+/* --- 视图切换 --- */
+
+function amOpenView() {
+  AM.open = true;
+  $('searchView').hidden = false;
+  $('panel').hidden = true;
+  document.body.classList.add('search-open');
+
+  // 第一次进来时把凭证状态拉一遍，让「音源设置」里的提示是准的
+  if (!AM.status) amRefreshStatus();
+  amRenderAll();
+
+  const input = $('amSearchInput');
+  if (input) {
+    input.focus();
+    if (AM.term && !input.value) input.value = AM.term;
+  }
+}
+
+function amCloseView() {
+  AM.open = false;
+  $('searchView').hidden = true;
+  // 有没有歌决定编辑区露不露，沿用既有规则
+  $('panel').hidden = !state.track;
+  document.body.classList.remove('search-open');
+}
+
 /* --- 状态 --- */
 
 function amRenderStatus(st) {
   AM.status = st;
-  const dot = $('amDot');
-  const hint = $('amHint');
   const line = $('amStatus');
   const note = $('amWvdNote');
   const state = $('amCookiesState');
-  const block = $('amCookiesBlock');
+  const hint = $('amHint');
 
   if (note) note.textContent = st.wvd === 'custom' ? '自定义' : '内置';
 
   const ready = !!st.ready && !!st.subscription;
-  dot.className = 'am-dot ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
-  dot.title = st.message || '';
 
-  // cookies 区块的状态行：一眼看出「配没配、能不能用」，并给下一步动作
   if (state) {
     if (ready) {
       state.textContent = '✓ 已配置，凭证有效';
@@ -3158,15 +3192,11 @@ function amRenderStatus(st) {
       state.className = 'am-cookies-state off';
     }
   }
-  // 配好了就把整块收起来（省空间）；没配就展开，逼着用户看见这一步
-  if (block) block.classList.toggle('is-set', ready);
 
-  if (ready) {
-    hint.textContent = '搜歌并下载完整音源。凭证有效，可以下载。';
-  } else if (!st.cookies) {
-    hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面粘贴 cookies。';
-  } else {
-    hint.textContent = 'cookies 已配置，但当前账号还不能下载（见下方状态）。';
+  if (hint) {
+    if (ready) hint.textContent = '凭证有效，可以下载完整音源。';
+    else if (!st.cookies) hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面粘贴 cookies。';
+    else hint.textContent = 'cookies 已配置，但当前账号还不能下载（见下方状态）。';
   }
 
   if (line) {
@@ -3191,61 +3221,101 @@ async function amRefreshStatus(force = false) {
   }
 }
 
-/* --- 搜索 --- */
+/* --- 结果渲染 --- */
 
-function amRenderResults() {
-  const box = $('amResults');
-  const moreRow = $('amMoreRow');
+function amRenderAll() {
+  const grid = $('amResults');
+  const empty = $('amEmpty');
+  const pager = $('amPager');
+  const counter = $('svCount');
+  if (!grid) return;
 
-  if (!AM.results.length) {
-    box.hidden = true;
-    box.innerHTML = '';
-    if (moreRow) moreRow.hidden = true;
+  const hasResults = AM.results.length > 0;
+
+  // 空态只在「还没搜过」时出现；搜完没结果用 toast 提示就够了
+  if (empty) empty.hidden = hasResults || AM.busy || !!AM.term && AM.results.length === 0;
+  if (pager) pager.hidden = !hasResults || !(AM.hasNext || AM.hasPrev);
+
+  if (counter) {
+    counter.textContent = hasResults
+      ? `第 ${AM.page} 页 · 本页 ${AM.results.length} 首`
+      : '';
+  }
+
+  if (!hasResults) {
+    grid.innerHTML = '';
     return;
   }
 
-  box.hidden = false;
-  box.innerHTML = AM.results
+  grid.innerHTML = AM.results
     .map((it, i) => {
       const busy = AM.importing === i;
       const art = it.artwork
-        ? `<img class="am-art" src="${escapeHtml(it.artwork)}" alt="" loading="lazy">`
-        : '<div class="am-art am-art-empty"></div>';
+        ? `<img class="sv-art" src="${escapeHtml(it.artwork)}" alt="" loading="lazy">`
+        : '<div class="sv-art sv-art-empty"></div>';
       const dur = it.duration ? formatClock(it.duration) : '';
-      return `<div class="am-row-item" data-i="${i}">
+      return `<div class="sv-card">
         ${art}
-        <div class="am-meta">
-          <div class="am-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
-          <div class="am-sub" title="${escapeHtml(it.album)}">${escapeHtml(it.artist)}${
-            it.album ? ' · ' + escapeHtml(it.album) : ''
-          }</div>
+        <div class="sv-info">
+          <div class="sv-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+          <div class="sv-sub" title="${escapeHtml(it.artist + (it.album ? ' · ' + it.album : ''))}">${
+            escapeHtml(it.artist)
+          }${it.album ? ' · ' + escapeHtml(it.album) : ''}</div>
         </div>
-        <span class="am-dur">${dur}</span>
-        <button class="btn ghost am-pick" type="button" data-i="${i}" ${
+        <span class="sv-dur">${dur}</span>
+        <button class="btn ghost" type="button" data-i="${i}" ${
           busy ? 'disabled' : ''
-        }>${busy ? '下载中…' : '下载'}</button>
+        }>${busy ? '下载中' : '下载'}</button>
       </div>`;
     })
     .join('');
 
-  // 「加载更多」只在确实可能还有下一页时出现
-  if (moreRow) {
-    moreRow.hidden = !AM.hasMore;
-    const btn = $('amMoreBtn');
-    if (btn) {
-      btn.disabled = AM.loadingMore;
-      btn.textContent = AM.loadingMore ? '加载中…' : '加载更多';
-    }
-    const hint = $('amMoreHint');
-    if (hint) hint.textContent = `已显示 ${AM.results.length} 条`;
-  }
+  amRenderPager();
 }
 
-async function amSearch() {
-  const term = $('amSearchInput').value.trim();
+/* 纯翻页：页码按钮 + 前后页。
+ * 页数未知（Apple 不给总数），所以只显示「当前页附近」的号码，
+ * 不做「1..N」那种假总数 —— 点到最后再显示到底了。 */
+function amRenderPager() {
+  const pages = $('amPages');
+  const prev = $('amPrevBtn');
+  const next = $('amNextBtn');
+  const hint = $('amPageHint');
+  if (!pages) return;
+
+  // 搜索进行中禁用翻页：连点会并发打请求，结果还可能乱序。
+  // 但禁用必须配视觉反馈 —— 否则用户点了没反应会以为坏了。
+  if (prev) prev.disabled = !AM.hasPrev || AM.busy;
+  if (next) next.disabled = !AM.hasNext || AM.busy;
+  if (hint) {
+    if (AM.busy) hint.textContent = '加载中…';
+    else if (AM.hasNext) hint.textContent = `每页 ${AM.pageSize} 首`;
+    else hint.textContent = '已经是最后一页';
+  }
+  // 当前页 ±2 的页码窗
+  const from = Math.max(1, AM.page - 2);
+  const to = AM.page + 2;
+  const nums = [];
+  for (let p = from; p <= to; p++) nums.push(p);
+
+  pages.innerHTML = nums
+    .map(
+      (p) =>
+        `<button class="sv-pill${p === AM.page ? ' on' : ''}" type="button" data-page="${p}" ${
+          AM.busy ? 'disabled' : ''
+        }>${p}</button>`
+    )
+    .join('');
+}
+
+/* --- 搜索 --- */
+
+async function amSearch(page = 1) {
+  const input = $('amSearchInput');
+  const term = (input ? input.value : AM.term).trim();
   if (!term) {
     toast('先输入歌名或歌手', 'warn');
-    $('amSearchInput').focus();
+    if (input) input.focus();
     return;
   }
   if (AM.busy) return;
@@ -3253,48 +3323,30 @@ async function amSearch() {
   AM.busy = true;
   AM.term = term;
   setBtnLoading($('amSearchBtn'), true, '搜索中…');
+  amRenderPager();
+
   try {
     const data = await amApi('/api/apple/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ term, offset: 0 }),
+      body: JSON.stringify({
+        term,
+        limit: AM.pageSize,
+        offset: (page - 1) * AM.pageSize,
+      }),
     });
     AM.results = data.items || [];
-    AM.hasMore = !!data.has_more;
-    amRenderResults();
-    if (!AM.results.length) toast('没搜到，换个关键词或换个地区试试', 'warn');
+    AM.page = data.page || page;
+    AM.hasNext = !!data.has_next;
+    AM.hasPrev = !!data.has_prev;
+    amRenderAll();
+    if (!AM.results.length) toast(`没搜到「${term}」，换个关键词或地区试试`, 'warn');
   } catch (err) {
     toast(`搜索失败：${err.message}`, 'error');
   } finally {
     AM.busy = false;
     setBtnLoading($('amSearchBtn'), false);
-  }
-}
-
-/* 翻页：把下一页追加到现有结果后面。
- * 新一批的下标接着旧的长度往下排，这样每行的「下载」按钮仍能用
- * data-i 定位到自己那一条。 */
-async function amLoadMore() {
-  if (AM.loadingMore || !AM.term || !AM.hasMore) return;
-
-  AM.loadingMore = true;
-  amRenderResults();
-  try {
-    const data = await amApi('/api/apple/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ term: AM.term, offset: AM.results.length }),
-    });
-    const more = data.items || [];
-    AM.results = AM.results.concat(more);
-    AM.hasMore = !!data.has_more;
-    amRenderResults();
-    if (!more.length) toast('没有更多结果了', 'info');
-  } catch (err) {
-    toast(`加载更多失败：${err.message}`, 'error');
-  } finally {
-    AM.loadingMore = false;
-    amRenderResults();
+    amRenderAll();
   }
 }
 
@@ -3305,10 +3357,10 @@ async function amImport(index) {
   if (!it || AM.importing >= 0) return;
 
   if (!AM.status || !AM.status.cookies) {
-    toast('还没有配置 cookies，先在下面「第 1 步」里粘贴', 'warn');
-    const box = $('amCookiesBlock');
+    toast('还没有配置 cookies，展开「音源设置」粘贴一下', 'warn');
+    const box = $('svSettings');
     if (box) {
-      box.classList.remove('is-set');
+      box.open = true;
       box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       const ta = $('amCookiesText');
       if (ta) ta.focus();
@@ -3317,48 +3369,33 @@ async function amImport(index) {
   }
 
   AM.importing = index;
-  amRenderResults();
-
-  const say = (msg) => {
-    const line = $('amStatus');
-    if (line) line.textContent = msg;
-  };
-  say(`正在下载《${it.name}》…`);
+  amRenderAll();
 
   try {
     const data = await amApi('/api/apple/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: it.url, name: `${it.artist} - ${it.name}` }),
+      // 歌名和歌手分开传，后端拼成「歌名-歌手」——
+      // 前端拼的话样式一改就要两边一起动。
+      body: JSON.stringify({ url: it.url, song: it.name, artist: it.artist }),
     });
     const record = data.data;
     if (addImportedTrack(record)) {
       toast(`《${it.name}》已加入歌曲库`, 'info');
-      say(
-        `已导入《${record.name}》，原曲 ${Math.round(record.detected_bpm)} BPM —— ` +
-          '右侧可直接设步频'
-      );
+      // 导入完直接切回编辑器，用户能立刻看到刚进来的那首
+      amCloseView();
     }
   } catch (err) {
     toast(`下载失败：${err.message}`, 'error');
-    say(`下载失败：${err.message}`);
-    // 失败多半是凭证问题，顺手复核一次状态，让红绿点说真话
+    // 失败多半是凭证问题，复核一次让提示说真话
     amRefreshStatus(true);
   } finally {
     AM.importing = -1;
-    amRenderResults();
+    amRenderAll();
   }
 }
 
 /* --- 凭证配置 --- */
-
-function amToggleConfig() {
-  const body = $('amConfigBody');
-  const btn = $('amConfigToggle');
-  const open = body.hidden;
-  body.hidden = !open;
-  btn.classList.toggle('is-open', open);
-}
 
 async function amSaveCookiesText() {
   const text = $('amCookiesText').value.trim();
@@ -3425,7 +3462,10 @@ async function amSaveStorefront(value) {
     });
     amRenderStatus(data.status);
     AM.results = [];
-    amRenderResults();
+    AM.page = 1;
+    AM.hasNext = false;
+    AM.hasPrev = false;
+    amRenderAll();
     toast(`地区已切到 ${value}，重新搜索即可`, 'info');
   } catch (err) {
     toast(`切换地区失败：${err.message}`, 'error');
@@ -3433,42 +3473,57 @@ async function amSaveStorefront(value) {
 }
 
 function amBind() {
+  // 顶栏入口 / 返回
+  const openBtn = $('topSearchBtn');
+  if (openBtn) openBtn.addEventListener('click', amOpenView);
+
+  const backBtn = $('svBackBtn');
+  if (backBtn) backBtn.addEventListener('click', amCloseView);
+
+  // 「音源设置」按钮把折叠块打开（而不是自己再写一套开关）
+  const setBtn = $('svSettingsBtn');
+  if (setBtn) {
+    setBtn.addEventListener('click', () => {
+      const box = $('svSettings');
+      if (!box) return;
+      box.open = true;
+      box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+  }
+
   const searchInput = $('amSearchInput');
   const searchBtn = $('amSearchBtn');
-  if (!searchInput || !searchBtn) return;   // 页面结构变了就安静跳过，不炸整页
+  if (!searchInput || !searchBtn) return;   // 页面结构变了就安静跳过
 
-  searchBtn.addEventListener('click', amSearch);
+  searchBtn.addEventListener('click', () => amSearch(1));
   searchInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      amSearch();
+      amSearch(1);
     }
   });
 
+  // 结果卡片上的「下载」
   $('amResults').addEventListener('click', (e) => {
-    const btn = e.target.closest('.am-pick');
+    const btn = e.target.closest('button[data-i]');
+    if (btn) amImport(Number(btn.dataset.i));
+  });
+
+  // 翻页
+  const prev = $('amPrevBtn');
+  const next = $('amNextBtn');
+  if (prev) prev.addEventListener('click', () => { if (AM.hasPrev) amSearch(AM.page - 1); });
+  if (next) next.addEventListener('click', () => { if (AM.hasNext) amSearch(AM.page + 1); });
+  $('amPages').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-page]');
     if (btn) {
-      amImport(Number(btn.dataset.i));
+      const p = Number(btn.dataset.page);
+      if (p !== AM.page) amSearch(p);
     }
   });
 
-  const moreBtn = $('amMoreBtn');
-  if (moreBtn) moreBtn.addEventListener('click', amLoadMore);
-
-  $('amConfigToggle').addEventListener('click', amToggleConfig);
   $('amCookiesSaveBtn').addEventListener('click', amSaveCookiesText);
   $('amCookiesClearBtn').addEventListener('click', amClearCookies);
-
-  // 展开「怎么拿到 cookies」后把它滚到可见：左栏窄，说明一撑开
-  // 下半截（输入框、保存按钮）就滑出视野了，用户会以为没东西可填。
-  const steps = $('amSteps');
-  if (steps) {
-    steps.addEventListener('toggle', () => {
-      if (steps.open) {
-        requestAnimationFrame(() => steps.scrollIntoView({ block: 'nearest' }));
-      }
-    });
-  }
   $('amCookiesFileBtn').addEventListener('click', () =>
     amPickFile('amCookiesFile', async (file) => {
       const text = await file.text();
@@ -3514,7 +3569,8 @@ function amBind() {
 
   $('amStorefront').addEventListener('change', (e) => amSaveStorefront(e.target.value));
 
-  amRefreshStatus();
+  // 启动时不主动拉状态：搜索视图没打开，用户也看不到。
+  // 等第一次点「搜歌下载」时再拉（见 amOpenView）。
 }
 
 amBind();

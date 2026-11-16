@@ -280,7 +280,11 @@ async def _ingest_one(file: UploadFile) -> dict:
         raise HTTPException(400, f"不支持这种格式，请上传 {allowed}")
 
     file_id = store.new_id()
-    original_name = file.filename or f"{file_id}{suffix}"
+    # 显示名优先用调用方给的好名字（下载导入的走这条，不带扩展名），
+    # 否则用上传时的原始文件名 —— 手动上传的文件名本来就是用户自己起的。
+    original_name = (
+        getattr(file, "display_name", None) or file.filename or f"{file_id}{suffix}"
+    )
     source_path = config.UPLOAD_DIR / f"{file_id}{suffix}"
 
     # ---- 分块落盘，边写边卡大小上限，避免大文件把内存吃满
@@ -763,7 +767,11 @@ class AppleImportRequest(BaseModel):
     """
 
     url: str = Field(..., min_length=1, max_length=2000)
-    name: str | None = Field(None, max_length=300, description="展示用名字，缺省用曲名")
+    # 分开传歌名和歌手，后端拼成「歌名-歌手」——
+    # 让前端拼字符串的话，样式一改就要前后端一起动。
+    song: str | None = Field(None, max_length=200, description="歌名")
+    artist: str | None = Field(None, max_length=200, description="歌手")
+    name: str | None = Field(None, max_length=300, description="兼容旧调用：直接给完整显示名")
 
 
 class AppleCookiesRequest(BaseModel):
@@ -834,13 +842,22 @@ async def apple_import(req: AppleImportRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise _apple_guard(exc) from exc
 
-    shown = (req.name or downloaded.stem).strip() or downloaded.stem
+    # 显示名：优先「歌名-歌手」（新格式），退回调用方给的 name，最后用文件名
+    if req.song:
+        shown = apple_music.display_name(req.song, req.artist or "")
+    else:
+        shown = (req.name or downloaded.stem).strip() or downloaded.stem
+        shown = apple_music.display_name(shown, "")
+
     try:
         local_path = await run_in_threadpool(apple_music.adopt, downloaded, shown)
     except Exception as exc:  # noqa: BLE001
         raise _apple_guard(exc) from exc
 
-    handle = _LocalFileHandle(local_path, f"{shown}{local_path.suffix}")
+    # filename 只用来判格式，显示名单独给 —— 界面上不该出现 .m4a
+    handle = _LocalFileHandle(
+        local_path, f"{shown}{local_path.suffix}", display_name=shown
+    )
     try:
         record = await _ingest_one(handle)
     except HTTPException:
@@ -856,16 +873,19 @@ async def apple_import(req: AppleImportRequest) -> dict:
 class _LocalFileHandle:
     """让磁盘上的一个文件**看起来像** ``UploadFile``。
 
-    ``_ingest_one`` 只用到 ``filename`` 和 ``read(n)`` 两样东西，
+    ``_ingest_one`` 只用到 ``filename`` / ``read(n)`` / ``display_name``，
     所以这里只需要实现它们，不必真的构造 starlette 的对象。
-    顺带把 ``size`` 属性也补上，语义更直白。
+
+    ``filename`` 负责格式判断（必须带扩展名）；
+    ``display_name`` 是给人看的（如 ``稻香-周杰伦``，不带扩展名）。
     """
 
-    __slots__ = ("filename", "path", "_handle")
+    __slots__ = ("filename", "display_name", "path", "_handle")
 
-    def __init__(self, path: Path, filename: str) -> None:
+    def __init__(self, path: Path, filename: str, display_name: str | None = None) -> None:
         self.path = Path(path)
         self.filename = filename
+        self.display_name = display_name
         self._handle = None
 
     async def read(self, size: int = -1) -> bytes:

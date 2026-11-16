@@ -293,11 +293,16 @@ def account_status(force: bool = False) -> dict:
 # --------------------------------------------------------------------------
 
 
-def search(term: str, limit: int = 25, offset: int = 0) -> dict:
+PAGE_SIZE = 12          # 每页条数：三列 × 四行，正好铺满一屏
+MAX_PAGE = 30           # 翻页上限，防止一路点到底把 Apple 惹毛
+
+
+def search(term: str, limit: int = PAGE_SIZE, offset: int = 0) -> dict:
     """按关键词搜歌曲。走公开 catalog 接口，**不需要 cookies 或订阅**。
 
-    ``offset`` 用于翻页：Apple 的 catalog 返回里带 ``next`` 字段，但直接用它
-    更省事 —— 这里自己累加 offset，接口语义对前端更直白。
+    分页语义：``offset`` 是「跳过前多少条」，前端按 page 换算。
+    另外返回 ``total`` 之类的精确总数 Apple 并不给（只有 next 链接），
+    所以页数用「有没有下一页」推算 —— 见 ``has_next``。
     """
     keyword = (term or "").strip()
     if not keyword:
@@ -305,8 +310,8 @@ def search(term: str, limit: int = 25, offset: int = 0) -> dict:
     if len(keyword) > 120:
         keyword = keyword[:120]
 
-    limit = max(1, min(int(limit or 25), 50))
-    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or PAGE_SIZE), 50))
+    offset = max(0, min(int(offset or 0), PAGE_SIZE * MAX_PAGE))
 
     # 必须在真正调用 gamdl 之前接管日志，否则非 GBK 字符会打崩请求
     _install_safe_logging()
@@ -324,13 +329,20 @@ def search(term: str, limit: int = 25, offset: int = 0) -> dict:
         raise AppleMusicError(f"搜索失败：{_humanize(exc)}") from exc
 
     items = _shape_songs(raw)
+
+    # 满一页就认为还有下一页；最后一页不足 12 条自然是 false。
+    # 不做额外探测请求 —— 多打一次 Apple 换一个「是否还有」不值当。
+    has_next = len(items) >= limit
+
+    page = offset // limit + 1
     return {
         "term": keyword,
         "items": items,
+        "page": page,
+        "page_size": limit,
         "offset": offset,
-        "limit": limit,
-        # 拿满一页就假定还有下一页（省一次探测请求）；不足一页说明到底了。
-        "has_more": len(items) >= limit,
+        "has_next": has_next,
+        "has_prev": page > 1,
         "storefront": storefront(),
     }
 
@@ -524,13 +536,15 @@ def adopt(downloaded: Path, shown_name: str | None = None) -> Path:
 
     搬离 ``imports/`` 的原因：``imports/`` 是暂存区，会被清理逻辑当垃圾删；
     而 ``uploads/`` 里的文件才被 ``store`` 登记、被后续变速流程正常使用。
+
+    ``shown_name`` 是给界面看的名字（``歌名-歌手``），会写进登记表。
+    物理文件名仍用随机 id，避免同名/非法字符问题。
     """
     src = Path(downloaded)
     suffix = src.suffix.lower()
     if suffix not in config.ALLOWED_SUFFIXES:
         suffix = ".m4a"
 
-    stem = _safe_stem(shown_name or src.stem)
     file_id = uuid.uuid4().hex[:16]
     dest = config.UPLOAD_DIR / f"{file_id}{suffix}"
     try:
@@ -541,6 +555,19 @@ def adopt(downloaded: Path, shown_name: str | None = None) -> Path:
         _cleanup_dir(src.parent)
 
     return dest
+
+
+def display_name(song_name: str, artist: str) -> str:
+    """界面上显示的名字：``歌名-歌手``。
+
+    刻意**不带扩展名**：``.m4a`` 这类后缀对用户没意义，还会把歌名挤短。
+    手动上传的文件仍保留原文件名（那是用户自己给的，不该动）。
+    """
+    title = (song_name or "").strip() or "未知曲目"
+    who = (artist or "").strip()
+    if not who:
+        return _safe_stem(title)
+    return _safe_stem(f"{title}-{who}")
 
 
 def _safe_stem(name: str) -> str:
