@@ -507,12 +507,18 @@ function syncPreviewBtns() {
   }
 }
 
-/* 底部播放键是「播放/暂停」合一：这一路正在放就换成暂停图标，其余情况是播放图标。
- * 只认 'live' —— 裁剪/变速试听各有自己的按钮在管。 */
+/* 底部播放键是「播放/暂停」合一：只要**有声音在播**就换成暂停图标。
+ *
+ * 早先这里只认 activeMode === 'live'，于是用「试听变速」播放时
+ * （activeMode 是 'speed'）底部仍显示播放图标 —— 明明在播却像没播。
+ * 裁剪/变速试听虽然各有自己的按钮，但底部这条是全局播放条，
+ * 它的职责就是反映「现在到底有没有在出声」，所以三路都算。 */
+const LIVE_MODES = ['live', 'clip', 'speed'];
+
 function syncPlayBtn() {
   const btn = $('playLiveBtn');
   if (!btn) return;
-  const playing = activeMode === 'live' && !liveAudio.paused;
+  const playing = LIVE_MODES.includes(activeMode) && !liveAudio.paused;
   btn.classList.toggle('is-playing', playing);
   btn.title = playing
     ? '暂停（再点一次从暂停处接着放）'
@@ -2005,10 +2011,15 @@ function pauseLive() {
   stopWave();
 }
 
-/* 底部播放键：播放/暂停合一。 */
+/* 底部播放键：播放/暂停合一。
+ *
+ * 只要在出声（不管哪一路）就执行暂停，而不是切回 live 重播 ——
+ * 早先只判 'live'，于是在「试听变速」播放中点它会跳到 live 模式重放，
+ * 用户听到的是「点了一下反而从头开始」。 */
 function toggleLivePreview() {
   if (!state.track) return;
-  if (activeMode === 'live' && !liveAudio.paused) { pauseLive(); return; }
+  if (LIVE_MODES.includes(activeMode) && !liveAudio.paused) { pauseLive(); return; }
+  // 停着的时候再点：从进度条位置起播成品效果（live 模式）
   playLive();
 }
 
@@ -3079,10 +3090,13 @@ if (window.matchMedia && matchMedia('(pointer: coarse)').matches) {
  * ========================================================================== */
 
 const AM = {
-  results: [],        // 当前搜索结果
+  results: [],        // 当前搜索结果（翻页时累积）
   busy: false,        // 搜索中
   importing: -1,      // 正在下载的结果下标（-1 = 没有）
   status: null,       // /api/apple/status 的最近一次结果
+  term: '',           // 本次搜索用的关键词（翻页要用同一个）
+  hasMore: false,     // 还有没有下一页
+  loadingMore: false,
 };
 
 /* 把新入库的一首歌追加进歌曲库并切过去。逻辑与 handleFiles 里成功那一段一致，
@@ -3181,9 +3195,12 @@ async function amRefreshStatus(force = false) {
 
 function amRenderResults() {
   const box = $('amResults');
+  const moreRow = $('amMoreRow');
+
   if (!AM.results.length) {
     box.hidden = true;
     box.innerHTML = '';
+    if (moreRow) moreRow.hidden = true;
     return;
   }
 
@@ -3210,6 +3227,18 @@ function amRenderResults() {
       </div>`;
     })
     .join('');
+
+  // 「加载更多」只在确实可能还有下一页时出现
+  if (moreRow) {
+    moreRow.hidden = !AM.hasMore;
+    const btn = $('amMoreBtn');
+    if (btn) {
+      btn.disabled = AM.loadingMore;
+      btn.textContent = AM.loadingMore ? '加载中…' : '加载更多';
+    }
+    const hint = $('amMoreHint');
+    if (hint) hint.textContent = `已显示 ${AM.results.length} 条`;
+  }
 }
 
 async function amSearch() {
@@ -3222,14 +3251,16 @@ async function amSearch() {
   if (AM.busy) return;
 
   AM.busy = true;
+  AM.term = term;
   setBtnLoading($('amSearchBtn'), true, '搜索中…');
   try {
     const data = await amApi('/api/apple/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ term }),
+      body: JSON.stringify({ term, offset: 0 }),
     });
     AM.results = data.items || [];
+    AM.hasMore = !!data.has_more;
     amRenderResults();
     if (!AM.results.length) toast('没搜到，换个关键词或换个地区试试', 'warn');
   } catch (err) {
@@ -3237,6 +3268,33 @@ async function amSearch() {
   } finally {
     AM.busy = false;
     setBtnLoading($('amSearchBtn'), false);
+  }
+}
+
+/* 翻页：把下一页追加到现有结果后面。
+ * 新一批的下标接着旧的长度往下排，这样每行的「下载」按钮仍能用
+ * data-i 定位到自己那一条。 */
+async function amLoadMore() {
+  if (AM.loadingMore || !AM.term || !AM.hasMore) return;
+
+  AM.loadingMore = true;
+  amRenderResults();
+  try {
+    const data = await amApi('/api/apple/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ term: AM.term, offset: AM.results.length }),
+    });
+    const more = data.items || [];
+    AM.results = AM.results.concat(more);
+    AM.hasMore = !!data.has_more;
+    amRenderResults();
+    if (!more.length) toast('没有更多结果了', 'info');
+  } catch (err) {
+    toast(`加载更多失败：${err.message}`, 'error');
+  } finally {
+    AM.loadingMore = false;
+    amRenderResults();
   }
 }
 
@@ -3394,6 +3452,9 @@ function amBind() {
     }
   });
 
+  const moreBtn = $('amMoreBtn');
+  if (moreBtn) moreBtn.addEventListener('click', amLoadMore);
+
   $('amConfigToggle').addEventListener('click', amToggleConfig);
   $('amCookiesSaveBtn').addEventListener('click', amSaveCookiesText);
   $('amCookiesClearBtn').addEventListener('click', amClearCookies);
@@ -3471,6 +3532,11 @@ window.__runbeat = {
   renderBpmChips,
   renderBeatHead,
   renderVerdict,
+  // 播放状态机：排查「按钮显示与实际播放不一致」时要能直接驱动它
+  setActive,
+  syncPlayBtn,
+  LIVE_MODES,
+  getActiveMode: () => activeMode,
   renderMappingHint,
   renderExportResult,
   showNowPlaying,

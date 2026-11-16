@@ -293,8 +293,12 @@ def account_status(force: bool = False) -> dict:
 # --------------------------------------------------------------------------
 
 
-def search(term: str, limit: int = 25) -> dict:
-    """按关键词搜歌曲。走公开 catalog 接口，**不需要 cookies 或订阅**。"""
+def search(term: str, limit: int = 25, offset: int = 0) -> dict:
+    """按关键词搜歌曲。走公开 catalog 接口，**不需要 cookies 或订阅**。
+
+    ``offset`` 用于翻页：Apple 的 catalog 返回里带 ``next`` 字段，但直接用它
+    更省事 —— 这里自己累加 offset，接口语义对前端更直白。
+    """
     keyword = (term or "").strip()
     if not keyword:
         raise AppleMusicError("搜索关键词是空的")
@@ -302,13 +306,16 @@ def search(term: str, limit: int = 25) -> dict:
         keyword = keyword[:120]
 
     limit = max(1, min(int(limit or 25), 50))
+    offset = max(0, int(offset or 0))
 
     # 必须在真正调用 gamdl 之前接管日志，否则非 GBK 字符会打崩请求
     _install_safe_logging()
 
     async def _run() -> dict:
         api = await _api_for_search()
-        raw = await api.get_search_results(keyword, types="songs", limit=limit)
+        raw = await api.get_search_results(
+            keyword, types="songs", limit=limit, offset=offset
+        )
         return raw
 
     try:
@@ -316,7 +323,16 @@ def search(term: str, limit: int = 25) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise AppleMusicError(f"搜索失败：{_humanize(exc)}") from exc
 
-    return {"term": keyword, "items": _shape_songs(raw), "storefront": storefront()}
+    items = _shape_songs(raw)
+    return {
+        "term": keyword,
+        "items": items,
+        "offset": offset,
+        "limit": limit,
+        # 拿满一页就假定还有下一页（省一次探测请求）；不足一页说明到底了。
+        "has_more": len(items) >= limit,
+        "storefront": storefront(),
+    }
 
 
 async def _api_for_search():

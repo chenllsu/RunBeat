@@ -213,16 +213,19 @@ html, body { height: 100%; }
  * 压到 6px（热区仍留 10px 好抓）。左栏缓存清单另有 6px 版本，见下面对应规则。 */
 .main::-webkit-scrollbar,
 .sidebar .file-list::-webkit-scrollbar,
+.am-results::-webkit-scrollbar,
 html::-webkit-scrollbar,
 body::-webkit-scrollbar { width: 10px; height: 10px; }
 
 .main::-webkit-scrollbar-track,
 .sidebar .file-list::-webkit-scrollbar-track,
+.am-results::-webkit-scrollbar-track,
 html::-webkit-scrollbar-track,
 body::-webkit-scrollbar-track { background: transparent; }
 
 .main::-webkit-scrollbar-thumb,
 .sidebar .file-list::-webkit-scrollbar-thumb,
+.am-results::-webkit-scrollbar-thumb,
 html::-webkit-scrollbar-thumb,
 body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, .1);
@@ -233,6 +236,7 @@ body::-webkit-scrollbar-thumb {
 
 .main::-webkit-scrollbar-thumb:hover,
 .sidebar .file-list::-webkit-scrollbar-thumb:hover,
+.am-results::-webkit-scrollbar-thumb:hover,
 html::-webkit-scrollbar-thumb:hover,
 body::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, .24);
@@ -271,6 +275,15 @@ body::-webkit-scrollbar-thumb:hover {
 }
 
 /* 左栏里的文件列表自己滚：歌多的时候不会把「应用到全部」顶出屏幕 */
+/* 歌曲库卡片：和缓存卡片平分剩余高度，但**不许被压没**。
+ * .side-card 的 min-height: 0 本意是允许内部自己滚，可一旦左栏塞进
+ * 搜歌面板，剩余空间不够时它就会缩到 0 —— 卡片标题栏只剩半截、歌名
+ * 一行都看不见。这里给一个够放下「标题 + 至少两行歌」的下限。 */
+.sidebar #listCard {
+  flex: 1 1 auto;
+  min-height: 148px;
+}
+
 .sidebar .file-list {
   flex: 1;
   min-height: 60px;
@@ -1802,7 +1815,14 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
  * 复用 .side-card 的卡片外观，这里只补它自己的内部布局。
  * ========================================================================== */
 
-.am-card { flex: 0 0 auto; }
+/* 搜歌卡片：允许收缩（flex-basis auto 但可被压缩），否则它按内容撑到 290px 后
+ * 会把下面的「歌曲库」挤成 0 高 —— 实测歌曲库整块消失就是这么来的。
+ * 高度上限给得保守些：搜索结果和歌曲库都要看得见，谁也不能把对方挤没。 */
+.am-card {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 38vh;
+}
 
 /* 状态点：绿=可下载，黄=有 cookies 但不可用，灰=没配 */
 .am-dot {
@@ -1841,6 +1861,28 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 .am-input:focus { outline: none; border-color: var(--accent); }
 
 .am-go { flex: 0 0 auto; padding: 8px 14px; font-size: 12px; }
+
+/* 「加载更多」那一行：按钮占满宽，右侧小字显示已加载多少条 */
+.am-more-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex: 0 0 auto;
+}
+
+.am-more {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 11.5px;
+}
+
+.am-more-hint {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
 
 /* 结果列表：自己滚，最多占一屏的一半，不把下面的设置挤走 */
 .am-results {

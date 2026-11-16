@@ -752,6 +752,7 @@ async def download(name: str, as_name: str | None = None):
 class AppleSearchRequest(BaseModel):
     term: str = Field(..., min_length=1, max_length=200, description="歌名/歌手/专辑关键词")
     limit: int = Field(25, ge=1, le=50)
+    offset: int = Field(0, ge=0, description="跳过前多少条，用于翻页")
 
 
 class AppleImportRequest(BaseModel):
@@ -806,7 +807,9 @@ async def apple_status(force: bool = False) -> dict:
 async def apple_search(req: AppleSearchRequest) -> dict:
     """按歌名搜索。**不需要 cookies**，没配凭证也能用。"""
     try:
-        return await run_in_threadpool(apple_music.search, req.term, req.limit)
+        return await run_in_threadpool(
+            apple_music.search, req.term, req.limit, req.offset
+        )
     except Exception as exc:  # noqa: BLE001
         raise _apple_guard(exc) from exc
 
