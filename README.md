@@ -2,6 +2,8 @@
 
 **为跑者做的跑步音乐生成器**：把任意一首歌改成**你的步频** —— 每一步踩在一拍上，音高不变。
 
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+
 跑步听歌最扫兴的事莫过于节奏和脚步打架：歌是好歌，可它的速度不由你。科学上有个好用的锚点 ——
 步频 170~180 spm（每分钟步数）是多数跑者舒适区，但市面上的歌很少正好落在这个速度上。
 RunBeat 解决的就是这件事：
@@ -489,3 +491,50 @@ BPM 检测精度靠 `ANALYSIS_HOP = 256` 撑着 —— 这是把帧移从 libros
   「试听变速」「试听成品」才是浏览器实时变速版，音色与成品不完全一致 ——
   要听真实效果请用「生成完整文件」。
 - 请仅处理你有权使用的音频。公开运营需自行考虑版权合规问题。
+
+---
+
+## 开源许可与致谢
+
+本项目以 **GPL-3.0** 发布（见 [LICENSE](LICENSE)）。选择 GPL-3.0 是硬性约束：
+在线音源功能依赖 pywidevine（GPL-3.0），按其条款，包含它的作品整体分发时必须同样以 GPL-3.0 授权。
+
+### 致谢链
+
+在线音源功能站在这些开源项目的肩膀上：
+
+| 项目 | 许可 | 在本项目中的角色 |
+|---|---|---|
+| [gamdl](https://github.com/glomatico/gamdl) | MIT | Apple Music 解析 / 解密 / 下载的核心 |
+| [AppleMusic-Downloader](https://github.com/wenfeng110402/AppleMusic-Downloader) | Unlicense | 下载链路封装（amdl，本项目直接调用的包） |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | 音轨流下载 |
+| [pywidevine](https://github.com/devine-dl/pywidevine) | GPL-3.0 | Widevine 解密（GPL 传染的来源） |
+| [librosa](https://github.com/librosa/librosa) | ISC | BPM 检测 |
+| [ffmpeg](https://ffmpeg.org/)（经 imageio-ffmpeg 分发） | LGPL/GPL | 时间伸缩、格式转换 |
+
+衷心感谢上述项目的所有贡献者。
+
+### 关于 pyplayready（CC BY-NC-ND）
+
+gamdl 会自动把 pyplayready（CC BY-NC-ND 4.0：禁商用、禁演绎）作为传递依赖装进来，
+该许可与本项目「允许商用修改、GPL 传染」的授权模型冲突。
+
+处理方式：**app/_vendor_stubs/pyplayready** 是一个同名空壳垫片，启动时遮住真包
+（见 `app/__init__.py`）。效果：
+
+- 本项目**仅支持 Widevine 解密路径**（实测所有下载均走此路径，PlayReady 从未启用）；
+- 任何代码试图走 PlayReady 后端会立即收到明确报错，而不是静默失败；
+- 功能不受任何影响 —— 搜索、下载、解密、变速全部照常。
+
+如果你需要 PlayReady 后端，请自行安装真实 pyplayready 并移除垫片，
+但那意味着整个项目不再满足 CC BY-NC-ND 的分发条件，请自行评估。
+
+### 免责声明
+
+1. 本项目不直接提供或存储任何受版权保护的内容；
+   在线音源功能需要用户**自行提供**合法的 Apple Music 订阅凭证（cookies）才能使用。
+2. 本项目仅供个人学习与研究，请勿用于任何违反当地法律法规的用途；
+   DRM 规避在部分司法辖区受法律限制（如 DMCA 1201），使用前请了解你所在地的规定。
+3. 变速处理的原曲由用户自行提供或自行下载，处理结果也仅供个人使用，
+   请勿分发、公开传播或商用。
+4. 使用本项目即表示你理解并同意自行承担全部合规责任。
