@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -973,6 +973,31 @@ async def apple_save_settings(req: AppleSettingsRequest) -> dict:
 # --------------------------------------------------------------------------
 # 静态资源（注意：根路径的挂载必须放在最后）
 # --------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def _no_cache_frontend(request: Request, call_next):
+    """给前端页面与脚本关掉浏览器缓存。
+
+    ``StaticFiles`` 会带 ``ETag`` / ``Last-Modified``，浏览器据此做协商缓存。
+    问题是改完 ``index.html`` / ``app.js`` 后用户刷新看到的还是旧页面 ——
+    实测踩过：界面结构已经改成「常驻 cookies 区块」，用户那边仍在看折叠版，
+    于是「点展开没反应」，排查时极具误导性。
+
+    这里只对**前端静态资源**下手（页面 / js / css），媒体文件（``/media/*``
+    下的音频成品）维持原样 —— 那些体积大且不可变，缓存反而是好事。
+    """
+    response = await call_next(request)
+    path = request.url.path
+
+    is_media = path.startswith("/media/")
+    is_api = path.startswith("/api/")
+    if not is_media and not is_api:
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 app.mount("/media/source", StaticFiles(directory=str(config.UPLOAD_DIR)), name="source")
 app.mount("/media/preview", StaticFiles(directory=str(config.PREVIEW_DIR)), name="preview")
