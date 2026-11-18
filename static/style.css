@@ -213,16 +213,19 @@ html, body { height: 100%; }
  * 压到 6px（热区仍留 10px 好抓）。左栏缓存清单另有 6px 版本，见下面对应规则。 */
 .main::-webkit-scrollbar,
 .sidebar .file-list::-webkit-scrollbar,
+.am-results::-webkit-scrollbar,
 html::-webkit-scrollbar,
 body::-webkit-scrollbar { width: 10px; height: 10px; }
 
 .main::-webkit-scrollbar-track,
 .sidebar .file-list::-webkit-scrollbar-track,
+.am-results::-webkit-scrollbar-track,
 html::-webkit-scrollbar-track,
 body::-webkit-scrollbar-track { background: transparent; }
 
 .main::-webkit-scrollbar-thumb,
 .sidebar .file-list::-webkit-scrollbar-thumb,
+.am-results::-webkit-scrollbar-thumb,
 html::-webkit-scrollbar-thumb,
 body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, .1);
@@ -233,6 +236,7 @@ body::-webkit-scrollbar-thumb {
 
 .main::-webkit-scrollbar-thumb:hover,
 .sidebar .file-list::-webkit-scrollbar-thumb:hover,
+.am-results::-webkit-scrollbar-thumb:hover,
 html::-webkit-scrollbar-thumb:hover,
 body::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, .24);
@@ -271,6 +275,15 @@ body::-webkit-scrollbar-thumb:hover {
 }
 
 /* 左栏里的文件列表自己滚：歌多的时候不会把「应用到全部」顶出屏幕 */
+/* 歌曲库卡片：和缓存卡片平分剩余高度，但**不许被压没**。
+ * .side-card 的 min-height: 0 本意是允许内部自己滚，可一旦左栏塞进
+ * 搜歌面板，剩余空间不够时它就会缩到 0 —— 卡片标题栏只剩半截、歌名
+ * 一行都看不见。这里给一个够放下「标题 + 至少两行歌」的下限。 */
+.sidebar #listCard {
+  flex: 1 1 auto;
+  min-height: 148px;
+}
+
 .sidebar .file-list {
   flex: 1;
   min-height: 60px;
@@ -1797,6 +1810,684 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 /* 系统开了「减弱动效」就整体关掉：这类用户要的是结果，不是过程。
  * 写在文件最后，盖掉上面所有声明。 */
+/* ==========================================================================
+ * 在线音源（Apple Music）面板
+ * 复用 .side-card 的卡片外观，这里只补它自己的内部布局。
+ * ========================================================================== */
+
+/* 搜歌卡片：允许收缩（flex-basis auto 但可被压缩），否则它按内容撑到 290px 后
+ * 会把下面的「歌曲库」挤成 0 高 —— 实测歌曲库整块消失就是这么来的。
+ *
+ * 高度上限 + overflow 让**整张卡自己滚**：结果多的时候滚这张卡，
+ * 而不是把内部列表压扁（压扁会出现「只露半行」的怪状态）。
+ * padding-right 给滚动条留位，免得按钮被压在条下面。 */
+.am-card {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 42vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 8px;
+}
+
+/* 这张卡自己滚，滚动条也要跟全站一致（不然又是一条浅色系统条） */
+.am-card::-webkit-scrollbar { width: 10px; height: 10px; }
+.am-card::-webkit-scrollbar-track { background: transparent; }
+.am-card::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .1);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
+.am-card::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .24);
+  background-clip: padding-box;
+}
+
+/* 状态点：绿=可下载，黄=有 cookies 但不可用，灰=没配 */
+.am-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+  align-self: center;
+  margin-left: auto;
+  flex: 0 0 auto;
+  transition: background var(--dur-2) var(--ease);
+}
+.am-dot.ok { background: var(--accent); box-shadow: 0 0 6px rgba(var(--accent-rgb), .7); }
+.am-dot.warn { background: var(--warn); }
+.am-dot.off { background: var(--dim); }
+
+.am-search {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex: 0 0 auto;
+}
+
+.am-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 10px;
+  transition: border-color var(--dur-1) var(--ease);
+}
+.am-input::placeholder { color: var(--dim); }
+.am-input:focus { outline: none; border-color: var(--accent); }
+
+.am-go { flex: 0 0 auto; padding: 8px 14px; font-size: 12px; }
+
+/* 「加载更多」那一行：按钮占满宽，右侧小字显示已加载多少条 */
+.am-more-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex: 0 0 auto;
+}
+
+.am-more {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 11.5px;
+}
+
+.am-more-hint {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 结果列表：按内容自然高度，**不做内部滚动**。
+ *
+ * 早先给它设 max-height + overflow 想让它自己滚，结果左栏高度紧张时
+ * 它被压到只剩半行（列表里明明有 25 条却只露一条边）。现在改成
+ * 整张搜歌卡片自己滚，列表按实际条数撑开 —— 用户一滚就能看到所有结果，
+ * 不会出现「内容被压扁」这种看不懂的状态。
+ * 高度上限交给 .am-card 的 max-height 统一管。 */
+.am-results {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.am-row-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  animation: amIn var(--dur-3) var(--ease) both;
+}
+
+@keyframes amIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.am-art {
+  width: 38px;
+  height: 38px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: var(--line-soft);
+}
+.am-art-empty { border: 1px solid var(--line); }
+
+.am-meta { flex: 1; min-width: 0; }
+
+.am-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.am-sub {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.am-dur {
+  font-size: 11px;
+  color: var(--dim);
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.am-pick { flex: 0 0 auto; padding: 5px 10px; font-size: 11.5px; }
+
+/* --- cookies 前置区块 ---
+ * 这是下载的必要条件，必须一直可见。配好且可用后（.is-set）才收成一行，
+ * 省出空间给搜索结果。 */
+
+.am-cookies {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
+/* 已配好且可用：折叠成「标题 + 清除」一行，免得长期占地方 */
+.am-cookies.is-set .am-steps,
+.am-cookies.is-set .am-textarea {
+  display: none;
+}
+
+.am-cookies-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+}
+
+.am-cookies-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.am-cookies-state {
+  font-size: 11px;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.am-cookies-state.ok { color: var(--accent); }
+.am-cookies-state.warn { color: var(--warn); }
+.am-cookies-state.off { color: var(--dim); }
+
+.am-cookies-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+/* --- 分步说明（cookies 怎么来）---
+ * 左栏只有 ~270px 宽，编号列表必须紧凑：编号缩小、行高收紧、
+ * 链接单独成行，否则挤成一坨反而更难读。 */
+
+.am-steps {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  background: var(--bg);
+}
+
+.am-steps > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  list-style: none;
+  user-select: none;
+}
+/* 去掉默认三角，换成自己的小箭头，和「高级设置」保持一致 */
+.am-steps > summary::-webkit-details-marker { display: none; }
+.am-steps > summary::before {
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.am-steps[open] > summary::before { transform: rotate(90deg); }
+
+.am-steps-list {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.am-steps-list li { padding-left: 1px; }
+.am-steps-list li::marker { color: var(--accent); font-weight: 600; }
+
+/* code 出现在说明里，要能和正文区分但别太亮 */
+.am-steps code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 0 3px;
+  color: var(--text);
+}
+
+.am-steps-links {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.am-steps-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  word-break: break-all;
+}
+.am-steps-links a:hover { text-decoration: underline; }
+
+.am-steps-tip {
+  margin-top: 9px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--line-soft);
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+/* --- 高级设置（可折叠）--- */
+
+.am-config { margin-top: 8px; flex: 0 0 auto; }
+
+.am-config-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* 折叠开关做成整行可点，比一个小链接好点得多 */
+.am-link {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 3px 0;
+  border-radius: 4px;
+  text-align: left;
+  transition: color var(--dur-1) var(--ease);
+}
+.am-link:hover { color: var(--accent); }
+.am-link::before {
+  /* 用 CSS 转义写 ▸，保持源文件这一行是纯 ASCII ——
+     scripts/check_frontend.py 会用系统编码（GBK）打印可疑行，
+     源码里直接放这个符号会让检查脚本自己抛 UnicodeEncodeError。 */
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.am-link.is-open::before { transform: rotate(90deg); }
+.am-link.is-open { color: var(--accent); }
+
+.am-config-body {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.am-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.am-textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 7px;
+  resize: vertical;
+  min-height: 54px;
+}
+.am-textarea:focus { outline: none; border-color: var(--accent); }
+
+.am-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* cookies 那三个按钮要挤在一行：左栏很窄，「选 cookies.txt」+「保存」+「清除」
+   一起放不下时会折行，看着像布局坏了。这里收紧内边距保证同行，字号不再缩小
+   （10.5px 在窄栏里已经糊成一团了）。 */
+.am-cookies .am-row { flex-wrap: nowrap; gap: 5px; }
+.am-cookies .am-row .am-mini {
+  padding: 6px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  min-width: 0;
+  /* 「选 cookies.txt」按内容占宽，另外两个按内容自适应 */
+  flex: 0 1 auto;
+}
+
+.am-mini { padding: 5px 9px; font-size: 11px; }
+
+.am-select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.am-select:focus { outline: none; border-color: var(--accent); }
+
+.am-note { font-size: 11px; color: var(--dim); margin-left: auto; }
+
+.am-status {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+  padding-top: 4px;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 2px;
+  word-break: break-word;
+}
+.am-status.ok { color: var(--accent); }
+.am-status.warn { color: var(--warn); }
+.am-status.off { color: var(--dim); }
+
+/* ==========================================================================
+ * 搜索视图（右栏整块切换）
+ * 点顶栏「搜歌下载」进入，占满编辑区 —— 结果三列 × 四行 = 12 首，纯翻页。
+ * ========================================================================== */
+
+#searchView {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 不撑满整屏：内容多高就多高，翻页器紧跟网格下面。
+     之前用 min-height:100% 把翻页器顶到了屏幕最底部，中间空一大片。 */
+}
+
+.sv-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.sv-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.sv-count { font-size: 11.5px; color: var(--dim); }
+.sv-spacer { flex: 1; }
+.sv-head .btn { padding: 6px 12px; font-size: 12px; }
+
+.sv-search {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.sv-search input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13.5px;
+  padding: 10px 13px;
+  transition: border-color var(--dur-1) var(--ease);
+}
+.sv-search input::placeholder { color: var(--dim); }
+.sv-search input:focus { outline: none; border-color: var(--accent); }
+
+.sv-search .btn { flex: 0 0 auto; padding: 10px 20px; }
+
+/* --- 音源设置（折叠） --- */
+
+.sv-settings {
+  flex: 0 0 auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.sv-settings > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sv-settings > summary::-webkit-details-marker { display: none; }
+.sv-settings > summary::before {
+  content: "\25B8\00a0";
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease);
+}
+.sv-settings[open] > summary::before { transform: rotate(90deg); }
+.sv-settings[open] > summary { color: var(--accent); margin-bottom: 10px; }
+
+.sv-set-block {
+  border-top: 1px solid var(--line-soft);
+  padding: 12px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sv-set-block:first-of-type { border-top: none; padding-top: 0; }
+
+.sv-set-title {
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sv-set-hint { font-size: 11px; color: var(--dim); line-height: 1.6; }
+
+/* 设置区比侧栏宽，说明文字可以更舒展 */
+.sv-settings .am-steps { max-width: 720px; }
+.sv-settings .am-textarea { max-width: 720px; min-height: 70px; }
+
+/* --- 结果网格 --- */
+
+.sv-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  flex: 1 1 auto;
+  align-content: start;
+}
+
+.sv-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color var(--dur-1) var(--ease);
+  animation: svIn var(--dur-3) var(--ease) both;
+  min-width: 0;
+}
+.sv-card:hover { border-color: var(--accent); }
+.sv-card.importing { border-color: var(--accent); }
+
+@keyframes svIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.sv-art {
+  width: 46px;
+  height: 46px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: var(--line-soft);
+}
+.sv-art-empty { border: 1px solid var(--line); }
+
+.sv-info { flex: 1; min-width: 0; }
+
+.sv-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sv-sub {
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.sv-dur {
+  font-size: 10.5px;
+  color: var(--dim);
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.sv-card .btn {
+  flex: 0 0 auto;
+  padding: 5px 11px;
+  font-size: 11.5px;
+}
+
+/* --- 翻页 --- */
+
+.sv-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 6px 0 2px;
+}
+
+.sv-pill {
+  min-width: 31px;
+  height: 31px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--dur-1) var(--ease);
+}
+.sv-pill:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.sv-pill:disabled { opacity: .35; cursor: not-allowed; }
+.sv-pill.on {
+  background: var(--grad);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.sv-pages { display: inline-flex; gap: 5px; }
+
+.sv-page-hint {
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-left: 4px;
+}
+
+.sv-empty {
+  padding: 60px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* --- 顶部进度条 ---
+ * 搜索：indeterminate（流动细条）—— 一次 HTTP 请求拿不到分步进度，
+ *       假百分比只会让人觉得卡住；转圈 + 已用时才是诚实的表达。
+ * 下载：真实百分比（后端按阶段权重折算），宽度直接绑 percent。 */
+.sv-progress {
+  position: relative;
+  height: 4px;
+  border-radius: 3px;
+  background: var(--line-soft);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.sv-progress-bar {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--grad);
+  transition: width var(--dur-2) var(--ease);
+}
+
+/* indeterminate 态：一段 30% 宽的亮条来回跑 */
+.sv-progress.indet .sv-progress-bar {
+  width: 30% !important;
+  animation: svSlide 1.1s var(--ease) infinite;
+}
+
+@keyframes svSlide {
+  from { transform: translateX(-110%); }
+  to   { transform: translateX(380%); }
+}
+
+.sv-progress-text {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.sv-progress-text .spinner { width: 11px; height: 11px; border-width: 2px; }
+.sv-progress-text b { color: var(--text); font-weight: 600; }
+.sv-progress-text .sv-pct { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+/* 下载中的卡片：进度条嵌在卡片底部 */
+.sv-card .sv-card-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--line-soft);
+}
+.sv-card .sv-card-progress > div {
+  height: 100%;
+  background: var(--grad);
+  transition: width var(--dur-2) var(--ease);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: .01ms !important;

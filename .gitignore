@@ -16,3 +16,9 @@ data/numba_cache/*
 !data/analysis/.gitkeep
 !data/previews/.gitkeep
 !data/outputs/.gitkeep
+
+# 在线音源：本机设置与凭证，绝不进版本库
+data/imports/*
+data/settings.json
+data/cookies.txt
+data/widevine.wvd

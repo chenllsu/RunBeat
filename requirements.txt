@@ -16,3 +16,9 @@ imageio-ffmpeg>=0.5
 # 桌面版窗口外壳（runbeat_desktop.py 用）。
 # 只跑 uvicorn 的纯网页模式其实用不到，但打成 exe 必须带上，所以列进依赖。
 pywebview>=5.0
+
+# ⚠️ 关于 pyplayready：gamdl 会自动把它作为传递依赖装进来（无法阻止），
+#    但它是 CC BY-NC-ND（禁商用/禁演绎），本项目为合规开源不能用。
+#    解法见 app/_vendor_stubs/pyplayready/__init__.py —— 项目启动时用
+#    同名空壳垫片遮住真包，只保留 Widevine 解密路径。功能不受影响。
+#    （不要手动 pip install pyplayready，也不要删掉那个垫片目录。）

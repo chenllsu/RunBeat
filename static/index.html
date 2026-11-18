@@ -14,6 +14,7 @@
     <h1 class="logo">Run<span>Beat</span></h1>
     <span class="slogan">把任何一首歌改成你的步频</span>
     <span class="tb-spacer"></span>
+    <button class="btn" id="topSearchBtn" type="button">⌕ 搜歌下载</button>
     <button class="btn primary" id="topAddBtn" type="button">＋ 添加歌曲</button>
   </header>
 
@@ -42,6 +43,7 @@
         第一次用？三步：<b>选一首歌</b> → 它自动测出原曲节奏 → <b>设你的步频</b>生成匹配的音乐 → 导出放进跑步播放器。
       </div>
       <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" multiple hidden>
+
 
       <section class="side-card" id="listCard" hidden>
         <div class="side-head">
@@ -106,6 +108,129 @@
 
     <!-- ============================ 右栏：编辑器 -->
     <main class="main scroll">
+
+      <!-- ====================== 搜索视图
+           点顶栏「搜歌下载」时整块切换到这里。
+           为什么放在右栏而不是左栏：搜索结果要横向铺开（三列 × 四行 = 12 首），
+           挤在 266px 的侧栏里只能滚动，看着难受。 -->
+      <div id="searchView" hidden>
+        <!-- 顶部进度条：搜索时是流动的细条（Apple 不给分步进度，做假百分比没意义），
+             下载时是真实的阶段进度（0~100%）。铺在搜索视图最顶端，宽屏一眼可见。 -->
+        <div class="sv-progress" id="svProgress" hidden>
+          <div class="sv-progress-bar" id="svProgressBar"></div>
+        </div>
+        <div class="sv-progress-text" id="svProgressText" hidden></div>
+
+        <div class="sv-head">
+          <h2>搜歌下载</h2>
+          <span class="sv-count" id="svCount"></span>
+          <span class="sv-spacer"></span>
+          <button class="btn ghost" id="svSettingsBtn" type="button">⚙ 音源设置</button>
+          <button class="btn ghost" id="svBackBtn" type="button">← 返回编辑</button>
+        </div>
+
+        <div class="sv-search">
+          <input id="amSearchInput" type="search" autocomplete="off"
+                 placeholder="歌名 / 歌手，回车搜索">
+          <button class="btn primary" id="amSearchBtn" type="button">搜索</button>
+        </div>
+
+        <!-- 凭证/地区设置：平时收起，点「音源设置」展开 -->
+        <details class="sv-settings" id="svSettings">
+          <summary>音源设置（cookies / Widevine CDM / 地区）</summary>
+
+          <div class="sv-set-block">
+            <div class="sv-set-title">
+              第 1 步 · 配置 cookies
+              <span class="am-cookies-state" id="amCookiesState">未配置</span>
+            </div>
+            <div class="sv-set-hint" id="amHint">
+              从 Apple Music 搜索并下载完整音源。先在下面粘贴 cookies。
+            </div>
+
+            <details class="am-steps" id="amSteps">
+              <summary>怎么拿到 cookies？（点开看三步）</summary>
+              <ol class="am-steps-list">
+                <li>
+                  <b>在浏览器里登录</b> <code>music.apple.com</code>，
+                  确认右上角是你的账号头像（没登录拿到的 cookies 无效）。
+                </li>
+                <li>
+                  <b>装一个导出插件</b>，在 music.apple.com 页面点它导出：
+                  <div class="am-steps-links">
+                    <a href="https://chromewebstore.google.com/detail/open-cookiestxt/gdocmgbfkjnnpapoeobnolbbkoibbcif"
+                       target="_blank" rel="noopener">Chrome / Edge：Open Cookies.txt</a>
+                    <a href="https://addons.mozilla.org/firefox/addon/export-cookies-txt/"
+                       target="_blank" rel="noopener">Firefox：Export Cookies</a>
+                  </div>
+                </li>
+                <li>
+                  <b>把导出的内容贴到下面</b>，点「保存」。
+                  也可以直接点「选 cookies.txt」选那个文件。
+                </li>
+              </ol>
+              <div class="am-steps-tip">
+                ⚠️ cookies 会过期。如果之前能用、隔几天突然不行了，
+                多半是过期了，重新导出一次即可。
+                <br>
+                这些内容只存在你本机的 <code>data/cookies.txt</code>，
+                不会上传到任何地方。
+              </div>
+            </details>
+
+            <textarea class="am-textarea" id="amCookiesText" rows="3"
+                      placeholder="把 cookies.txt 的全部内容粘贴到这里"></textarea>
+            <div class="am-row">
+              <button class="btn ghost am-mini" id="amCookiesFileBtn" type="button">选 cookies.txt</button>
+              <button class="btn ghost am-mini" id="amCookiesSaveBtn" type="button">保存</button>
+              <button class="btn ghost am-mini" id="amCookiesClearBtn" type="button">清除</button>
+            </div>
+            <input type="file" id="amCookiesFile" accept=".txt,text/plain" hidden>
+            <div class="am-status" id="amStatus">尚未检查</div>
+          </div>
+
+          <div class="sv-set-block">
+            <div class="sv-set-title">
+              Widevine CDM
+              <span class="am-note" id="amWvdNote">内置</span>
+            </div>
+            <div class="sv-set-hint">默认用内置的。内置失效时，可以指定你自己的 .wvd。</div>
+            <div class="am-row">
+              <button class="btn ghost am-mini" id="amWvdFileBtn" type="button">选择 .wvd</button>
+              <button class="btn ghost am-mini" id="amWvdClearBtn" type="button">恢复内置</button>
+            </div>
+            <input type="file" id="amWvdFile" accept=".wvd" hidden>
+          </div>
+
+          <div class="sv-set-block">
+            <div class="sv-set-title">地区</div>
+            <div class="sv-set-hint">决定能搜到 / 下载到什么。</div>
+            <select class="am-select" id="amStorefront">
+              <option value="cn">中国大陆 cn</option>
+              <option value="us">美国 us</option>
+              <option value="jp">日本 jp</option>
+              <option value="hk">香港 hk</option>
+              <option value="tw">台湾 tw</option>
+              <option value="sg">新加坡 sg</option>
+              <option value="gb">英国 gb</option>
+            </select>
+          </div>
+        </details>
+
+        <div class="sv-grid" id="amResults"></div>
+
+        <!-- 纯翻页：不做「加载更多」，结果按页整块换 -->
+        <div class="sv-pager" id="amPager" hidden>
+          <button class="sv-pill" id="amPrevBtn" type="button">‹</button>
+          <span class="sv-pages" id="amPages"></span>
+          <button class="sv-pill" id="amNextBtn" type="button">›</button>
+          <span class="sv-page-hint" id="amPageHint"></span>
+        </div>
+
+        <div class="sv-empty" id="amEmpty" hidden>
+          输入歌名或歌手，回车开始搜索。
+        </div>
+      </div>
 
       <div id="panel" hidden>
 

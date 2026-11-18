@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import threading
@@ -15,13 +16,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, audio, config, store, update
+from . import __version__, apple_music, audio, config, store, update
 
 # 预热进度。打包版首次运行要现场编译 numba，可能要一两分钟；
 # 记下状态，前端才能在等待期间说清「为什么慢」。
@@ -279,7 +280,11 @@ async def _ingest_one(file: UploadFile) -> dict:
         raise HTTPException(400, f"不支持这种格式，请上传 {allowed}")
 
     file_id = store.new_id()
-    original_name = file.filename or f"{file_id}{suffix}"
+    # 显示名优先用调用方给的好名字（下载导入的走这条，不带扩展名），
+    # 否则用上传时的原始文件名 —— 手动上传的文件名本来就是用户自己起的。
+    original_name = (
+        getattr(file, "display_name", None) or file.filename or f"{file_id}{suffix}"
+    )
     source_path = config.UPLOAD_DIR / f"{file_id}{suffix}"
 
     # ---- 分块落盘，边写边卡大小上限，避免大文件把内存吃满
@@ -744,8 +749,293 @@ async def download(name: str, as_name: str | None = None):
 
 
 # --------------------------------------------------------------------------
+# 在线音源（Apple Music）
+# --------------------------------------------------------------------------
+
+
+class AppleSearchRequest(BaseModel):
+    term: str = Field(..., min_length=1, max_length=200, description="歌名/歌手/专辑关键词")
+    limit: int = Field(25, ge=1, le=50)
+    offset: int = Field(0, ge=0, description="跳过前多少条，用于翻页")
+
+
+class AppleImportRequest(BaseModel):
+    """按搜索结果里那条的完整 URL 导入。
+
+    用完整 URL 而不是裸 song id：Apple 的单曲 URL 带 ``?i=<id>``，
+    缺了它就变成「整张专辑」，下载器会下一堆歌回来。
+    """
+
+    url: str = Field(..., min_length=1, max_length=2000)
+    # 分开传歌名和歌手，后端拼成「歌名-歌手」——
+    # 让前端拼字符串的话，样式一改就要前后端一起动。
+    song: str | None = Field(None, max_length=200, description="歌名")
+    artist: str | None = Field(None, max_length=200, description="歌手")
+    name: str | None = Field(None, max_length=300, description="兼容旧调用：直接给完整显示名")
+
+
+class AppleCookiesRequest(BaseModel):
+    # 两种来源二选一：粘贴文本，或传一个本地文件路径
+    text: str | None = Field(None, max_length=200_000)
+    path: str | None = Field(None, max_length=2000)
+
+
+class AppleSettingsRequest(BaseModel):
+    storefront: str | None = Field(None, max_length=10)
+    language: str | None = Field(None, max_length=20)
+
+
+class AppleWvdRequest(BaseModel):
+    # 二选一：传本地路径（开发/高级用法），或传 base64 内容（浏览器只能用这条）
+    path: str | None = Field(None, max_length=2000)
+    data: str | None = Field(None, max_length=20_000_000)
+    name: str | None = Field(None, max_length=300)
+
+
+def _apple_guard(exc: Exception) -> HTTPException:
+    """把 apple_music 抛的业务异常翻译成 4xx，而不是一律 500。"""
+    if isinstance(exc, apple_music.AppleMusicError):
+        return HTTPException(400, str(exc))
+    return HTTPException(500, f"意外错误：{exc}")
+
+
+@app.get("/api/apple/status")
+async def apple_status(force: bool = False) -> dict:
+    """凭证状态：有没有 cookies、能不能用、有没有订阅、用的哪份 CDM。
+
+    ``force=true`` 跳过 30 秒缓存 —— 用户刚保存完 cookies 时会要求立刻复核。
+    """
+    try:
+        return await run_in_threadpool(apple_music.account_status, force)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+
+@app.post("/api/apple/search")
+async def apple_search(req: AppleSearchRequest) -> dict:
+    """按歌名搜索。**不需要 cookies**，没配凭证也能用。"""
+    try:
+        return await run_in_threadpool(
+            apple_music.search, req.term, req.limit, req.offset
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+
+@app.post("/api/apple/import")
+async def apple_import(req: AppleImportRequest) -> dict:
+    """下载一首歌的完整音源并入库。
+
+    下载全程 20~60 秒，同步等完会让前端干等还拿不到进度 —— 所以这里只
+    登记**任务**立刻返回 ``task_id``，真正的下载在后台线程跑，
+    前端拿 id 轮询 ``GET /api/apple/import/{task_id}``。
+    """
+    cookies_ok = await run_in_threadpool(apple_music.cookies_ready)
+    if not cookies_ok:
+        raise HTTPException(400, "还没有配置 cookies，无法下载完整音源")
+
+    # 显示名：优先「歌名-歌手」（新格式），退回调用方给的 name
+    if req.song:
+        shown = apple_music.display_name(req.song, req.artist or "")
+    else:
+        shown = apple_music.display_name(req.name or "未知曲目", "")
+
+    tid = await run_in_threadpool(
+        apple_music.task_create, f"{shown}"
+    )
+
+    # 后台线程里跑完整链路；_ingest_one 注入进去避免循环 import。
+    # daemon=True：服务关闭时不被它拖住 —— 本机任务丢了重下就是。
+    worker = threading.Thread(
+        target=apple_music.run_import_task,
+        args=(tid, req.url, req.song or "", req.artist or "", _ingest_one),
+        daemon=True,
+    )
+    worker.start()
+
+    return {
+        "ok": True,
+        "task_id": tid,
+        "title": shown,
+        "status": "pending",
+        "source": "apple-music",
+    }
+
+
+@app.get("/api/apple/import/{task_id}")
+async def apple_import_status(task_id: str) -> dict:
+    """轮询下载任务进度。任务结束（done/error）后保留 10 分钟可查。"""
+    snap = await run_in_threadpool(apple_music.task_snapshot, task_id)
+    if snap is None:
+        raise HTTPException(404, "任务不存在或已过期")
+    return snap
+
+
+@app.get("/api/apple/record/{task_id}")
+async def apple_import_record(task_id: str) -> dict:
+    """任务成功后取完整的入库 record（含 file_id / defaults 等全部字段）。
+
+    与轮询接口分开：轮询高频，不该每次都拖着 record 全文跑。
+    """
+    t = await run_in_threadpool(apple_music.task_get, task_id)
+    if t is None:
+        raise HTTPException(404, "任务不存在或已过期")
+    if t["status"] != "done" or not t.get("record"):
+        raise HTTPException(409, "任务尚未完成")
+    return {"ok": True, "data": t["record"], "source": "apple-music"}
+
+
+class _LocalFileHandle:
+    """让磁盘上的一个文件**看起来像** ``UploadFile``。
+
+    ``_ingest_one`` 只用到 ``filename`` / ``read(n)`` / ``display_name``，
+    所以这里只需要实现它们，不必真的构造 starlette 的对象。
+
+    ``filename`` 负责格式判断（必须带扩展名）；
+    ``display_name`` 是给人看的（如 ``稻香-周杰伦``，不带扩展名）。
+    """
+
+    __slots__ = ("filename", "display_name", "path", "_handle")
+
+    def __init__(self, path: Path, filename: str, display_name: str | None = None) -> None:
+        self.path = Path(path)
+        self.filename = filename
+        self.display_name = display_name
+        self._handle = None
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._handle is None:
+            self._handle = self.path.open("rb")
+        return self._handle.read(size)
+
+    async def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    @property
+    def size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+
+@app.post("/api/apple/cookies")
+async def apple_save_cookies(req: AppleCookiesRequest) -> dict:
+    """保存 cookies：支持「粘贴文本」和「本地文件路径」两种来源。"""
+    try:
+        if req.path:
+            result = await run_in_threadpool(
+                apple_music.save_cookies_from_file, Path(req.path)
+            )
+        elif req.text:
+            result = await run_in_threadpool(apple_music.save_cookies, req.text)
+        else:
+            raise HTTPException(400, "请粘贴 cookies 内容，或选择一个 cookies.txt 文件")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+
+    # 存完立刻复核一次，界面能直接显示「有效 / 无订阅 / 无效」
+    status = await run_in_threadpool(apple_music.account_status, True)
+    return {**result, "status": status}
+
+
+@app.delete("/api/apple/cookies")
+async def apple_clear_cookies() -> dict:
+    try:
+        result = await run_in_threadpool(apple_music.clear_cookies)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.post("/api/apple/wvd")
+async def apple_save_wvd(req: AppleWvdRequest) -> dict:
+    """保存用户自备的 Widevine CDM。不传就继续用内置那份。"""
+    if req.data:
+        try:
+            raw = base64.b64decode(req.data, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"CDM 内容无法解码：{exc}") from exc
+        if not raw:
+            raise HTTPException(400, "CDM 文件是空的")
+        # 简单校验：Widevine device 文件以 protobuf 字段 1 (0x0A) 起头
+        if len(raw) < 64:
+            raise HTTPException(400, "这不像一个有效的 .wvd 文件（内容太短）")
+        try:
+            config.WVD_FILE.write_bytes(raw)
+        except OSError as exc:
+            raise HTTPException(500, f"保存失败：{exc}") from exc
+        result = {"saved": True, "size": len(raw)}
+    elif req.path:
+        try:
+            result = await run_in_threadpool(apple_music.save_wvd, Path(req.path))
+        except Exception as exc:  # noqa: BLE001
+            raise _apple_guard(exc) from exc
+    else:
+        raise HTTPException(400, "请提供 .wvd 文件内容或路径")
+
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.delete("/api/apple/wvd")
+async def apple_clear_wvd() -> dict:
+    try:
+        result = await run_in_threadpool(apple_music.clear_wvd)
+    except Exception as exc:  # noqa: BLE001
+        raise _apple_guard(exc) from exc
+    return {**result, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+@app.get("/api/apple/settings")
+async def apple_get_settings() -> dict:
+    return {"settings": config.load_settings()}
+
+
+@app.post("/api/apple/settings")
+async def apple_save_settings(req: AppleSettingsRequest) -> dict:
+    """改地区/语言。改完要复核凭证 —— 换地区等于换一套 catalog。"""
+    try:
+        saved = await run_in_threadpool(
+            config.save_settings, req.model_dump(exclude_none=True)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, str(exc)) from exc
+    apple_music._invalidate_status()
+    return {"settings": saved, "status": await run_in_threadpool(apple_music.account_status, True)}
+
+
+# --------------------------------------------------------------------------
 # 静态资源（注意：根路径的挂载必须放在最后）
 # --------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def _no_cache_frontend(request: Request, call_next):
+    """给前端页面与脚本关掉浏览器缓存。
+
+    ``StaticFiles`` 会带 ``ETag`` / ``Last-Modified``，浏览器据此做协商缓存。
+    问题是改完 ``index.html`` / ``app.js`` 后用户刷新看到的还是旧页面 ——
+    实测踩过：界面结构已经改成「常驻 cookies 区块」，用户那边仍在看折叠版，
+    于是「点展开没反应」，排查时极具误导性。
+
+    这里只对**前端静态资源**下手（页面 / js / css），媒体文件（``/media/*``
+    下的音频成品）维持原样 —— 那些体积大且不可变，缓存反而是好事。
+    """
+    response = await call_next(request)
+    path = request.url.path
+
+    is_media = path.startswith("/media/")
+    is_api = path.startswith("/api/")
+    if not is_media and not is_api:
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 app.mount("/media/source", StaticFiles(directory=str(config.UPLOAD_DIR)), name="source")
 app.mount("/media/preview", StaticFiles(directory=str(config.PREVIEW_DIR)), name="preview")
