@@ -60,8 +60,56 @@ PREVIEW_DIR = DATA_DIR / "previews"    # 预览片段（服务端生成，带缓
 OUTPUT_DIR = DATA_DIR / "outputs"      # 完整成品，供下载
 TMP_DIR = DATA_DIR / "tmp"             # 混音用的中间文件，用完即删
 
-for _d in (UPLOAD_DIR, ANALYSIS_DIR, PREVIEW_DIR, OUTPUT_DIR, TMP_DIR):
+# ---------------------------------------------------------------- 在线音源
+# 只在本机保存 Apple Music 凭证，不上传、不经过任何第三方。
+SETTINGS_FILE = DATA_DIR / "settings.json"   # 输出目录 / 编码 / 地区等偏好
+COOKIES_FILE = DATA_DIR / "cookies.txt"      # Netscape 格式 cookies（含订阅凭证）
+WVD_FILE = DATA_DIR / "widevine.wvd"         # 用户自备的 Widevine CDM（可选）
+IMPORT_DIR = DATA_DIR / "imports"            # 在线下载的暂存区，导入后即清
+
+for _d in (UPLOAD_DIR, ANALYSIS_DIR, PREVIEW_DIR, OUTPUT_DIR, TMP_DIR, IMPORT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------- 设置读写
+# 只存「跟音源有关」的一小组偏好，不承担前端 localStorage 的职责。
+
+_DEFAULT_SETTINGS: dict = {
+    "storefront": "cn",     # Apple Music 地区，决定能搜到/下载到什么
+    "language": "zh-CN",    # 元数据语言
+}
+
+
+def load_settings() -> dict:
+    """读设置。文件不存在或读坏了都退回默认值 —— 不能因为一个坏 JSON 就打不开程序。"""
+    import json
+
+    data = dict(_DEFAULT_SETTINGS)
+    try:
+        raw = SETTINGS_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            data.update({k: v for k, v in parsed.items() if v is not None})
+    except (OSError, ValueError):
+        pass
+    return data
+
+
+def save_settings(patch: dict) -> dict:
+    """合并保存（不是覆盖）。只认白名单里的键，其余忽略。"""
+    import json
+
+    data = load_settings()
+    for key in _DEFAULT_SETTINGS:
+        if key in patch and patch[key] is not None:
+            data[key] = str(patch[key]).strip()
+    try:
+        SETTINGS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise RuntimeError(f"设置保存失败：{exc}") from exc
+    return data
 
 # ---------------------------------------------------------------- 上传限制
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024     # 单文件 20 MB

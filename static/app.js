@@ -15,6 +15,23 @@ const CLIP_TAIL_SEC = 5.0;   // 改终点时从「终点前这么多秒」开始
 const MAX_BATCH = 20;   // 与后端 config.MAX_BATCH_FILES 保持一致
 const FADE_MAX = 3.0;   // 开头渐入时长上限（秒），与后端 config.MAX_FADE_SEC 保持一致
 
+/* 在线音源的状态容器。
+ * 放在文件顶部而不是跟着下面的实现走：initUI() 等早期函数要读 AM.open
+ * 判断「搜索视图是不是在前台」，声明太靠后会踩 const 的暂时性死区。 */
+const AM = {
+  results: [],        // 当前这一页的结果
+  busy: false,        // 搜索中
+  importing: -1,      // 正在下载的结果下标（-1 = 没有）
+  status: null,       // /api/apple/status 的最近一次结果
+  statusPromise: null,// 正在进行的凭证状态请求（防重复，也供守卫 await）
+  term: '',           // 当前搜索词（翻页要沿用）
+  page: 1,            // 当前页码（1 起）
+  pageSize: 12,       // 与后端 apple_music.PAGE_SIZE 保持一致
+  hasNext: false,
+  hasPrev: false,
+  open: false,        // 搜索视图是否在前台
+};
+
 const state = {
   track: null,
   sourceBpm: null,
@@ -507,12 +524,18 @@ function syncPreviewBtns() {
   }
 }
 
-/* 底部播放键是「播放/暂停」合一：这一路正在放就换成暂停图标，其余情况是播放图标。
- * 只认 'live' —— 裁剪/变速试听各有自己的按钮在管。 */
+/* 底部播放键是「播放/暂停」合一：只要**有声音在播**就换成暂停图标。
+ *
+ * 早先这里只认 activeMode === 'live'，于是用「试听变速」播放时
+ * （activeMode 是 'speed'）底部仍显示播放图标 —— 明明在播却像没播。
+ * 裁剪/变速试听虽然各有自己的按钮，但底部这条是全局播放条，
+ * 它的职责就是反映「现在到底有没有在出声」，所以三路都算。 */
+const LIVE_MODES = ['live', 'clip', 'speed'];
+
 function syncPlayBtn() {
   const btn = $('playLiveBtn');
   if (!btn) return;
-  const playing = activeMode === 'live' && !liveAudio.paused;
+  const playing = LIVE_MODES.includes(activeMode) && !liveAudio.paused;
   btn.classList.toggle('is-playing', playing);
   btn.title = playing
     ? '暂停（再点一次从暂停处接着放）'
@@ -1252,7 +1275,8 @@ function setDropzoneBusy(done, total, name) {
 function initUI() {
   const t = state.track;
   // 批量模式下上传区**不隐藏** —— 随时可以再拖几首进来（追加到列表末尾）。
-  $('panel').hidden = false;
+  // 搜索视图在前台时不要抢回来：用户正在挑歌，突然被切走会很突兀。
+  $('panel').hidden = !!AM.open;
   $('playerBar').hidden = false;   // 底部常驻播放条跟着编辑器一起出现
 
   const okList = state.files.filter((f) => f.status === 'ok');
@@ -2005,10 +2029,15 @@ function pauseLive() {
   stopWave();
 }
 
-/* 底部播放键：播放/暂停合一。 */
+/* 底部播放键：播放/暂停合一。
+ *
+ * 只要在出声（不管哪一路）就执行暂停，而不是切回 live 重播 ——
+ * 早先只判 'live'，于是在「试听变速」播放中点它会跳到 live 模式重放，
+ * 用户听到的是「点了一下反而从头开始」。 */
 function toggleLivePreview() {
   if (!state.track) return;
-  if (activeMode === 'live' && !liveAudio.paused) { pauseLive(); return; }
+  if (LIVE_MODES.includes(activeMode) && !liveAudio.paused) { pauseLive(); return; }
+  // 停着的时候再点：从进度条位置起播成品效果（live 模式）
   playLive();
 }
 
@@ -3070,6 +3099,629 @@ if (window.matchMedia && matchMedia('(pointer: coarse)').matches) {
   if (big) big.textContent = '点这里选择音频文件';
 }
 
+/* ==========================================================================
+ * 在线音源（Apple Music）
+ *
+ * 和拖拽上传是**平级**的两条入口：下载完拿到的是和 /api/upload 完全一样的
+ * record，所以直接塞进 state.files 就能被现有的测速/变速/导出流程接管。
+ * 这里只负责「搜索 → 选择 → 下载入库」这一段，不碰任何音频处理逻辑。
+ *
+ * 界面上占的是**右栏整块**（#searchView），不是左栏那张窄卡片 ——
+ * 结果要三列铺开（12 首/页），塞在 266px 的侧栏里只能滚动，用着难受。
+ * ========================================================================== */
+
+/* AM 状态容器在前面（文件顶部）声明，这里只管行为。 */
+
+/* 把新入库的一首歌追加进歌曲库并切过去。逻辑与 handleFiles 里成功那一段一致，
+ * 抽出来是为了两处行为完全相同（勾选继承、自动进编辑器）。 */
+function addImportedTrack(record) {
+  if (state.files.length >= MAX_BATCH) {
+    toast(`列表里已经有 ${MAX_BATCH} 首了，先清掉一些再添加`, 'error');
+    return false;
+  }
+
+  const row = state.files.length;
+  state.files.push({
+    ...record,
+    params: defaultParams(record),
+    checked: Prefs.getChecked(record.name ?? '') ?? true,
+    status: 'ok',
+  });
+
+  // 只有当前没在编辑别的歌时才自动切过去，避免打断用户手头的活
+  if (state.current < 0) switchTo(row);
+  renderFileList();
+  return true;
+}
+
+async function amApi(path, options = {}) {
+  const res = await fetch(path, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `请求失败（HTTP ${res.status}）`);
+  return data;
+}
+
+/* --- 视图切换 --- */
+
+function amOpenView() {
+  AM.open = true;
+  $('searchView').hidden = false;
+  $('panel').hidden = true;
+  document.body.classList.add('search-open');
+
+  // 第一次进来时把凭证状态拉一遍，让「音源设置」里的提示是准的。
+  // 单例 Promise 防重复请求：搜索页里状态可能被多处触发，只打一次。
+  if (!AM.statusPromise) {
+    AM.statusPromise = amRefreshStatus().finally(() => { AM.statusPromise = null; });
+  }
+  amRenderAll();
+
+  const input = $('amSearchInput');
+  if (input) {
+    input.focus();
+    if (AM.term && !input.value) input.value = AM.term;
+  }
+}
+
+function amCloseView() {
+  AM.open = false;
+  $('searchView').hidden = true;
+  // 有没有歌决定编辑区露不露，沿用既有规则
+  $('panel').hidden = !state.track;
+  document.body.classList.remove('search-open');
+}
+
+/* --- 状态 --- */
+
+function amRenderStatus(st) {
+  AM.status = st;
+  const line = $('amStatus');
+  const note = $('amWvdNote');
+  const state = $('amCookiesState');
+  const hint = $('amHint');
+
+  if (note) note.textContent = st.wvd === 'custom' ? '自定义' : '内置';
+
+  const ready = !!st.ready && !!st.subscription;
+
+  if (state) {
+    if (ready) {
+      state.textContent = '✓ 已配置，凭证有效';
+      state.className = 'am-cookies-state ok';
+    } else if (st.cookies) {
+      state.textContent = '！已配置，但账号还不能下载';
+      state.className = 'am-cookies-state warn';
+    } else {
+      state.textContent = '未配置 · 登录 → 导出 → 粘贴';
+      state.className = 'am-cookies-state off';
+    }
+  }
+
+  if (hint) {
+    if (ready) hint.textContent = '凭证有效，可以下载完整音源。';
+    else if (!st.cookies) hint.textContent = '从 Apple Music 搜索并下载完整音源。先在下面粘贴 cookies。';
+    else hint.textContent = 'cookies 已配置，但当前账号还不能下载（见下方状态）。';
+  }
+
+  if (line) {
+    line.textContent = st.message || '';
+    line.className = 'am-status ' + (ready ? 'ok' : st.cookies ? 'warn' : 'off');
+  }
+
+  const sf = $('amStorefront');
+  if (sf && st.storefront && sf.value !== st.storefront) sf.value = st.storefront;
+}
+
+async function amRefreshStatus(force = false) {
+  try {
+    const st = await amApi(`/api/apple/status${force ? '?force=true' : ''}`);
+    amRenderStatus(st);
+  } catch (err) {
+    const line = $('amStatus');
+    if (line) {
+      line.textContent = `无法读取音源状态：${err.message}`;
+      line.className = 'am-status off';
+    }
+  }
+}
+
+/* --- 结果渲染 --- */
+
+function amRenderAll() {
+  const grid = $('amResults');
+  const empty = $('amEmpty');
+  const pager = $('amPager');
+  const counter = $('svCount');
+  if (!grid) return;
+
+  const hasResults = AM.results.length > 0;
+
+  // 空态只在「还没搜过」时出现；搜完没结果用 toast 提示就够了
+  if (empty) empty.hidden = hasResults || AM.busy || !!AM.term && AM.results.length === 0;
+  if (pager) pager.hidden = !hasResults || !(AM.hasNext || AM.hasPrev);
+
+  if (counter) {
+    counter.textContent = hasResults
+      ? `第 ${AM.page} 页 · 本页 ${AM.results.length} 首`
+      : '';
+  }
+
+  if (!hasResults) {
+    grid.innerHTML = '';
+    return;
+  }
+
+  grid.innerHTML = AM.results
+    .map((it, i) => {
+      const task = AM.importing === i ? AM.task : null;
+      const busy = !!task;
+      const art = it.artwork
+        ? `<img class="sv-art" src="${escapeHtml(it.artwork)}" alt="" loading="lazy">`
+        : '<div class="sv-art sv-art-empty"></div>';
+      const dur = it.duration ? formatClock(it.duration) : '';
+      // 下载中的卡片：按钮变成百分比，底部嵌一条真实进度
+      const progressHtml = task
+        ? `<div class="sv-card-progress"><div style="width:${task.percent}%"></div></div>`
+        : '';
+      const btnLabel = busy
+        ? `${task.percent}%`
+        : '下载';
+      return `<div class="sv-card${busy ? ' importing' : ''}">
+        ${art}
+        <div class="sv-info">
+          <div class="sv-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+          <div class="sv-sub" title="${escapeHtml(it.artist + (it.album ? ' · ' + it.album : ''))}">${
+            escapeHtml(it.artist)
+          }${it.album ? ' · ' + escapeHtml(it.album) : ''}</div>
+        </div>
+        <span class="sv-dur">${dur}</span>
+        <button class="btn ghost" type="button" data-i="${i}" ${busy ? 'disabled' : ''}>${btnLabel}</button>
+        ${progressHtml}
+      </div>`;
+    })
+    .join('');
+
+  amRenderPager();
+}
+
+/* 纯翻页：页码按钮 + 前后页。
+ * 页数未知（Apple 不给总数），所以只显示「当前页附近」的号码，
+ * 不做「1..N」那种假总数 —— 点到最后再显示到底了。 */
+function amRenderPager() {
+  const pages = $('amPages');
+  const prev = $('amPrevBtn');
+  const next = $('amNextBtn');
+  const hint = $('amPageHint');
+  if (!pages) return;
+
+  // 搜索进行中禁用翻页：连点会并发打请求，结果还可能乱序。
+  // 但禁用必须配视觉反馈 —— 否则用户点了没反应会以为坏了。
+  if (prev) prev.disabled = !AM.hasPrev || AM.busy;
+  if (next) next.disabled = !AM.hasNext || AM.busy;
+  if (hint) {
+    if (AM.busy) hint.textContent = '加载中…';
+    else if (AM.hasNext) hint.textContent = `每页 ${AM.pageSize} 首`;
+    else hint.textContent = '已经是最后一页';
+  }
+  // 当前页 ±2 的页码窗
+  const from = Math.max(1, AM.page - 2);
+  const to = AM.page + 2;
+  const nums = [];
+  for (let p = from; p <= to; p++) nums.push(p);
+
+  pages.innerHTML = nums
+    .map(
+      (p) =>
+        `<button class="sv-pill${p === AM.page ? ' on' : ''}" type="button" data-page="${p}" ${
+          AM.busy ? 'disabled' : ''
+        }>${p}</button>`
+    )
+    .join('');
+}
+
+/* --- 进度条 ---
+ * 两种模式共用同一条顶部进度条：
+ *   indeterminate —— 搜索用。一次 HTTP 请求拿不到分步进度，
+ *                    流动的亮条 + 已用时秒数，不造假百分比。
+ *   determinate   —— 下载用。后端按阶段权重折算出真实 0~100%。 */
+let amSearchTimer = null;
+
+function amProgressStart(text, indeterminate) {
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (!bar) return;
+  bar.hidden = false;
+  bar.classList.toggle('indet', !!indeterminate);
+  if (indeterminate) {
+    // indeterminate 的宽度由 CSS 动画接管，这里清掉内联宽度
+    $('svProgressBar').style.width = '';
+  }
+  if (txt) {
+    txt.hidden = false;
+    txt.innerHTML = `<span class="spinner"></span>${escapeHtml(text)}`;
+  }
+  // 搜索计时：超过 2 秒后显示已用时，让「还在跑」这件事自己说话
+  if (amSearchTimer) clearInterval(amSearchTimer);
+  if (indeterminate) {
+    const started = Date.now();
+    amSearchTimer = setInterval(() => {
+      const sec = Math.round((Date.now() - started) / 1000);
+      const el = $('svProgressText');
+      if (el && sec >= 2) {
+        el.innerHTML = `<span class="spinner"></span>搜索中… 已用时 <b>${sec}</b> 秒`;
+      }
+    }, 500);
+  }
+}
+
+function amProgressSet(percent, detail) {
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (!bar) return;
+  bar.hidden = false;
+  bar.classList.remove('indet');
+  $('svProgressBar').style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  if (txt) {
+    txt.hidden = false;
+    txt.innerHTML = `<span class="spinner"></span>${
+      escapeHtml(detail || '处理中…')
+    } <span class="sv-pct"><b>${percent}%</b></span>`;
+  }
+}
+
+function amProgressDone() {
+  if (amSearchTimer) { clearInterval(amSearchTimer); amSearchTimer = null; }
+  const bar = $('svProgress');
+  const txt = $('svProgressText');
+  if (bar) bar.hidden = true;
+  if (txt) { txt.hidden = true; txt.innerHTML = ''; }
+}
+
+/* --- 搜索 --- */
+
+async function amSearch(page = 1) {
+  const input = $('amSearchInput');
+  const term = (input ? input.value : AM.term).trim();
+  if (!term) {
+    toast('先输入歌名或歌手', 'warn');
+    if (input) input.focus();
+    return;
+  }
+  if (AM.busy) return;
+
+  AM.busy = true;
+  AM.term = term;
+  setBtnLoading($('amSearchBtn'), true, '搜索中…');
+  amProgressStart(`搜索「${term}」中…`, true);
+  amRenderPager();
+
+  try {
+    const data = await amApi('/api/apple/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        term,
+        limit: AM.pageSize,
+        offset: (page - 1) * AM.pageSize,
+      }),
+    });
+    AM.results = data.items || [];
+    AM.page = data.page || page;
+    AM.hasNext = !!data.has_next;
+    AM.hasPrev = !!data.has_prev;
+    if (!AM.results.length) toast(`没搜到「${term}」，换个关键词或地区试试`, 'warn');
+  } catch (err) {
+    toast(`搜索失败：${err.message}`, 'error');
+  } finally {
+    AM.busy = false;
+    setBtnLoading($('amSearchBtn'), false);
+    amProgressDone();
+    amRenderAll();
+  }
+}
+
+/* --- 下载入库 ---
+ * 接口改成任务制：POST 只拿 task_id，之后轮询进度。
+ * 进度显示两处：
+ *   - 顶部进度条（真实百分比 + 阶段说明）
+ *   - 被下载那张卡片底部嵌一条迷你进度条，按钮显示百分比
+ * 轮询间隔 800ms；任务超过 5 分钟视为卡死，提示用户。 */
+
+const AM_POLL_INTERVAL = 800;
+const AM_POLL_TIMEOUT = 5 * 60 * 1000;
+
+async function amImport(index) {
+  const it = AM.results[index];
+  if (!it || AM.importing >= 0) return;
+
+  // 凭证守卫：状态还没加载完时**等一下再判**，不要直接拒绝。
+  // 竞态实测：点「搜歌下载」后 amOpenView 里的 amRefreshStatus 是异步的，
+  // 网络慢时用户搜完歌点下载，AM.status 还是 null —— 旧逻辑在这里直接
+  // return，表现为「点了下载没反应」，连提示都没有。
+  if (!AM.status && AM.statusPromise) {
+    await AM.statusPromise;
+  }
+  if (!AM.status) {
+    await amRefreshStatus();
+  }
+  if (!AM.status || !AM.status.cookies) {
+    toast('还没有配置 cookies，展开「音源设置」粘贴一下', 'warn');
+    const box = $('svSettings');
+    if (box) {
+      box.open = true;
+      box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      const ta = $('amCookiesText');
+      if (ta) ta.focus();
+    }
+    return;
+  }
+
+  let taskId = '';
+  try {
+    const resp = await amApi('/api/apple/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 歌名和歌手分开传，后端拼成「歌名-歌手」——
+      // 前端拼的话样式一改就要两边一起动。
+      body: JSON.stringify({ url: it.url, song: it.name, artist: it.artist }),
+    });
+    taskId = resp.task_id;
+  } catch (err) {
+    toast(`提交下载失败：${err.message}`, 'error');
+    amRefreshStatus(true);
+    return;
+  }
+
+  AM.importing = index;
+  AM.task = { percent: 0, stage_label: '排队中', detail: '' };
+  amRenderAll();
+  amProgressSet(0, `《${it.name}》排队中…`);
+
+  const started = Date.now();
+  let lastStage = '';
+
+  const finish = (record, errMsg) => {
+    AM.importing = -1;
+    AM.task = null;
+    amProgressDone();
+    amRenderAll();
+    if (record) {
+      if (addImportedTrack(record)) {
+        toast(`《${it.name}》已加入歌曲库`, 'info');
+        amCloseView();   // 导入完切回编辑器，立刻看到刚进来的那首
+      }
+    } else {
+      toast(`下载失败：${errMsg}`, 'error');
+      amRefreshStatus(true);   // 失败多半是凭证问题，复核一次
+    }
+  };
+
+  // 轮询循环
+  while (true) {
+    await new Promise((r) => setTimeout(r, AM_POLL_INTERVAL));
+
+    let snap;
+    try {
+      snap = await amApi(`/api/apple/import/${taskId}`);
+    } catch (err) {
+      finish(null, err.message);
+      return;
+    }
+
+    if (Date.now() - started > AM_POLL_TIMEOUT) {
+      finish(null, '下载超时（超过 5 分钟），请检查网络后重试');
+      return;
+    }
+
+    // 阶段切换时把说明刷上去
+    if (snap.stage !== lastStage) {
+      lastStage = snap.stage;
+      amProgressSet(snap.percent, `${snap.stage_label}：${snap.detail || snap.title}`);
+    } else {
+      amProgressSet(snap.percent, snap.detail || snap.stage_label);
+    }
+
+    AM.task = { percent: snap.percent, stage_label: snap.stage_label, detail: snap.detail };
+    amRenderAll();
+
+    if (snap.status === 'done') {
+      // record 全文在主接口的内存表里；这里补一次拉取
+      try {
+        const full = await amApi('/api/apple/record/' + taskId);
+        finish(full.data, null);
+      } catch (err) {
+        // 拉不到 record（理论上不该发生），至少告诉用户成了
+        finish(null, '下载完成但读取结果失败，请重试');
+      }
+      return;
+    }
+    if (snap.status === 'error') {
+      finish(null, snap.error || '未知错误');
+      return;
+    }
+  }
+}
+
+/* --- 凭证配置 --- */
+
+async function amSaveCookiesText() {
+  const text = $('amCookiesText').value.trim();
+  if (!text) {
+    toast('先粘贴 cookies 内容，或选择 cookies.txt', 'warn');
+    return;
+  }
+  await amSaveCookies({ text });
+}
+
+async function amSaveCookies(payload) {
+  setBtnLoading($('amCookiesSaveBtn'), true, '保存中…');
+  try {
+    const data = await amApi('/api/apple/cookies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    amRenderStatus(data.status);
+    toast(
+      data.status.ready && data.status.subscription
+        ? 'cookies 已保存，凭证有效'
+        : 'cookies 已保存，但账号还不能下载（见下方状态）',
+      data.status.subscription ? 'info' : 'warn'
+    );
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'error');
+  } finally {
+    setBtnLoading($('amCookiesSaveBtn'), false);
+  }
+}
+
+async function amClearCookies() {
+  try {
+    const data = await amApi('/api/apple/cookies', { method: 'DELETE' });
+    amRenderStatus(data.status);
+    $('amCookiesText').value = '';
+    toast('cookies 已清除', 'info');
+  } catch (err) {
+    toast(`清除失败：${err.message}`, 'error');
+  }
+}
+
+/* 选文件走浏览器的原生 <input type=file>。
+ * 这里只拿文件名交给后端读 —— 桌面版本机同进程，后端读得到；
+ * 也顺手把内容读进 textarea，用户能看见自己选了什么。 */
+async function amPickFile(inputId, handler) {
+  const input = $(inputId);
+  input.value = '';
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    await handler(file);
+  };
+  input.click();
+}
+
+async function amSaveStorefront(value) {
+  try {
+    const data = await amApi('/api/apple/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storefront: value }),
+    });
+    amRenderStatus(data.status);
+    AM.results = [];
+    AM.page = 1;
+    AM.hasNext = false;
+    AM.hasPrev = false;
+    amRenderAll();
+    toast(`地区已切到 ${value}，重新搜索即可`, 'info');
+  } catch (err) {
+    toast(`切换地区失败：${err.message}`, 'error');
+  }
+}
+
+function amBind() {
+  // 顶栏入口 / 返回
+  const openBtn = $('topSearchBtn');
+  if (openBtn) openBtn.addEventListener('click', amOpenView);
+
+  const backBtn = $('svBackBtn');
+  if (backBtn) backBtn.addEventListener('click', amCloseView);
+
+  // 「音源设置」按钮把折叠块打开（而不是自己再写一套开关）
+  const setBtn = $('svSettingsBtn');
+  if (setBtn) {
+    setBtn.addEventListener('click', () => {
+      const box = $('svSettings');
+      if (!box) return;
+      box.open = true;
+      box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+  }
+
+  const searchInput = $('amSearchInput');
+  const searchBtn = $('amSearchBtn');
+  if (!searchInput || !searchBtn) return;   // 页面结构变了就安静跳过
+
+  searchBtn.addEventListener('click', () => amSearch(1));
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      amSearch(1);
+    }
+  });
+
+  // 结果卡片上的「下载」
+  $('amResults').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-i]');
+    if (btn) amImport(Number(btn.dataset.i));
+  });
+
+  // 翻页
+  const prev = $('amPrevBtn');
+  const next = $('amNextBtn');
+  if (prev) prev.addEventListener('click', () => { if (AM.hasPrev) amSearch(AM.page - 1); });
+  if (next) next.addEventListener('click', () => { if (AM.hasNext) amSearch(AM.page + 1); });
+  $('amPages').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-page]');
+    if (btn) {
+      const p = Number(btn.dataset.page);
+      if (p !== AM.page) amSearch(p);
+    }
+  });
+
+  $('amCookiesSaveBtn').addEventListener('click', amSaveCookiesText);
+  $('amCookiesClearBtn').addEventListener('click', amClearCookies);
+  $('amCookiesFileBtn').addEventListener('click', () =>
+    amPickFile('amCookiesFile', async (file) => {
+      const text = await file.text();
+      $('amCookiesText').value = text;
+      // 直接把内容发过去，绕开「后端能不能读到这个路径」的问题
+      await amSaveCookies({ text });
+    })
+  );
+
+  $('amWvdFileBtn').addEventListener('click', () =>
+    amPickFile('amWvdFile', async (file) => {
+      // .wvd 是二进制证书，前端不解析，只把字节交给后端落盘。
+      // 走 base64 而不是本地路径：浏览器拿不到真实路径，后端也不必相信它。
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let binary = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < buf.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
+      }
+      try {
+        const data = await amApi('/api/apple/wvd', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: btoa(binary), name: file.name }),
+        });
+        amRenderStatus(data.status);
+        toast('自定义 CDM 已保存', 'info');
+      } catch (err) {
+        toast(`保存 CDM 失败：${err.message}`, 'error');
+      }
+    })
+  );
+
+  $('amWvdClearBtn').addEventListener('click', async () => {
+    try {
+      const data = await amApi('/api/apple/wvd', { method: 'DELETE' });
+      amRenderStatus(data.status);
+      toast('已恢复使用内置 CDM', 'info');
+    } catch (err) {
+      toast(`操作失败：${err.message}`, 'error');
+    }
+  });
+
+  $('amStorefront').addEventListener('change', (e) => amSaveStorefront(e.target.value));
+
+  // 启动时不主动拉状态：搜索视图没打开，用户也看不到。
+  // 等第一次点「搜歌下载」时再拉（见 amOpenView）。
+}
+
+amBind();
+
 /* 调试出口：把内部状态与渲染函数挂到 window，
    便于本地预览、截图与排查问题（不影响正常使用）。 */
 window.__runbeat = {
@@ -3083,6 +3735,11 @@ window.__runbeat = {
   renderBpmChips,
   renderBeatHead,
   renderVerdict,
+  // 播放状态机：排查「按钮显示与实际播放不一致」时要能直接驱动它
+  setActive,
+  syncPlayBtn,
+  LIVE_MODES,
+  getActiveMode: () => activeMode,
   renderMappingHint,
   renderExportResult,
   showNowPlaying,
