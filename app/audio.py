@@ -279,7 +279,7 @@ def _band_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
 def _band_bpm(series: np.ndarray, fps: float) -> list[tuple[float, float]]:
     """单频带检测：自相关 → 峰 → 权重候选，返回 ``(BPM, 权重)`` 列表。
 
-    三道保险（照抄竞品）：lag 限制在 [BPM_LO, BPM_HI]；峰权重乘
+    三道保险（参考同类实现）：lag 限制在 [BPM_LO, BPM_HI]；峰权重乘
     ``sqrt((N-lag)/N)`` 压短 lag 高倍速伪峰；只取最强的 top 20% 峰。
     """
     ac = _autocorr_pearson(series)

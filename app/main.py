@@ -898,7 +898,7 @@ class _LocalFileHandle:
     所以这里只需要实现它们，不必真的构造 starlette 的对象。
 
     ``filename`` 负责格式判断（必须带扩展名）；
-    ``display_name`` 是给人看的（如 ``稻香-周杰伦``，不带扩展名）。
+    ``display_name`` 是给人看的（如 ``歌名-歌手``，不带扩展名）。
     """
 
     __slots__ = ("filename", "display_name", "path", "_handle")

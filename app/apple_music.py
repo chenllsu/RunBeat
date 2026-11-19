@@ -200,7 +200,7 @@ def _install_safe_logging() -> None:
     而 Apple 的搜索结果里常混着越南语/日语曲名 —— 一旦日志里出现 GBK
     编不出来的字符，``UnicodeEncodeError`` 会把**整个搜索请求**打崩。
 
-    实测崩溃点：搜「稻香」时日志里带出 ``ển``（越南语），抛
+    实测崩溃点：某中文歌的搜索结果里带出 ``ển``（越南语字符），抛
     ``'gbk' codec can't encode character '\\u1eb1'``。
 
     修法：换成一个 ``errors="replace"`` 的包装流。字符编不出来就写 ``?``，
