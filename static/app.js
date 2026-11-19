@@ -30,6 +30,7 @@ const AM = {
   hasNext: false,
   hasPrev: false,
   open: false,        // 搜索视图是否在前台
+  playing: -1,        // 正在试听 30 秒预览的结果下标（-1 = 没有）
 };
 
 const state = {
@@ -3148,7 +3149,6 @@ function amOpenView() {
   $('searchView').hidden = false;
   $('panel').hidden = true;
   document.body.classList.add('search-open');
-
   // 第一次进来时把凭证状态拉一遍，让「音源设置」里的提示是准的。
   // 单例 Promise 防重复请求：搜索页里状态可能被多处触发，只打一次。
   if (!AM.statusPromise) {
@@ -3165,6 +3165,7 @@ function amOpenView() {
 
 function amCloseView() {
   AM.open = false;
+  amStopPreview();   // 离开搜索页，试听别还挂着声音
   $('searchView').hidden = true;
   // 有没有歌决定编辑区露不露，沿用既有规则
   $('panel').hidden = !state.track;
@@ -3266,6 +3267,12 @@ function amRenderAll() {
       const btnLabel = busy
         ? `${task.percent}%`
         : '下载';
+      // 30 秒试听：有预览地址才显示按钮，正在放的那首变停止键
+      const previewing = AM.playing === i;
+      const playBtn = it.preview
+        ? `<button class="sv-play${previewing ? ' on' : ''}" type="button"
+             data-play="${i}" title="${previewing ? '停止试听' : '试听 30 秒'}">${previewing ? '⏸' : '▶'}</button>`
+        : '';
       return `<div class="sv-card${busy ? ' importing' : ''}">
         ${art}
         <div class="sv-info">
@@ -3275,6 +3282,7 @@ function amRenderAll() {
           }${it.album ? ' · ' + escapeHtml(it.album) : ''}</div>
         </div>
         <span class="sv-dur">${dur}</span>
+        ${playBtn}
         <button class="btn ghost" type="button" data-i="${i}" ${busy ? 'disabled' : ''}>${btnLabel}</button>
         ${progressHtml}
       </div>`;
@@ -3282,6 +3290,23 @@ function amRenderAll() {
     .join('');
 
   amRenderPager();
+}
+
+/* 下载中只刷新正在下载那张卡片：按钮百分比 + 底部进度条宽度。
+ * 不走 amRenderAll() 整区重建 —— 那样每 0.8 秒重画一次全部封面，
+ * 图片闪个不停。找不到卡片（用户翻了页/换了搜索词）就整个重画一次。 */
+function amUpdateImportingCard(percent) {
+  if (AM.importing < 0) return;
+  const grid = $('amResults');
+  const card = grid && grid.children[AM.importing];
+  if (!card || !card.classList.contains('importing')) {
+    amRenderAll();
+    return;
+  }
+  const btn = card.querySelector('button[data-i]');
+  if (btn) btn.textContent = `${percent}%`;
+  const bar = card.querySelector('.sv-card-progress > div');
+  if (bar) bar.style.width = `${percent}%`;
 }
 
 /* 纯翻页：页码按钮 + 前后页。
@@ -3373,8 +3398,93 @@ function amProgressDone() {
   if (amSearchTimer) { clearInterval(amSearchTimer); amSearchTimer = null; }
   const bar = $('svProgress');
   const txt = $('svProgressText');
+  const fail = $('svProgressFail');
   if (bar) bar.hidden = true;
   if (txt) { txt.hidden = true; txt.innerHTML = ''; }
+  if (fail) { fail.hidden = true; fail.open = false; }
+}
+
+/* 下载失败：进度区换成一条可展开的错误条 ——
+ * 摘要一句话 + 重试按钮，点开看后端记录的日志（最后几行）。
+ * 记住失败的是哪一首，重试直接再下它。 */
+let amLastFailed = -1;
+
+/* 失败后的凭证提醒：AM.status 刚被复核过，如果判定是凭证问题
+ * （cookies 没配 / 失效 / 没订阅），在失败条下方追加一句人话提醒，
+ * 并在展开区给出「怎么修」。凭证没问题就不打扰。 */
+function amHintCredential(errMsg) {
+  const fail = $('svProgressFail');
+  if (!fail || fail.hidden) return;
+  const st = AM.status;
+  if (!st) return;
+
+  let hint = '';
+  if (!st.cookies) {
+    hint = '本机还没有配置 cookies —— 先展开「音源设置」粘贴 cookies，再点重试。';
+  } else if (!st.ready) {
+    hint = `cookies 已失效或格式不对（${st.message}）—— 重新从浏览器导出一份再试。`;
+  } else if (!st.subscription) {
+    hint = 'cookies 能用，但这个账号没有有效的 Apple Music 订阅 —— 下载需要订阅。';
+  } else {
+    return;   // 凭证没问题，失败是别的原因（网络/地区），不加提醒
+  }
+
+  const body = fail.querySelector('.sv-fail-logs');
+  if (body) body.textContent = hint + '\n\n--- 下载日志 ---\n' + (body.textContent || '');
+}
+
+function amProgressFail(errMsg, logs, index) {
+  if (!errMsg) return;
+  const fail = $('svProgressFail');
+  if (!fail) return;
+  amLastFailed = typeof index === 'number' ? index : -1;
+  const summary = fail.querySelector('.sv-fail-text');
+  const body = fail.querySelector('.sv-fail-logs');
+  if (summary) summary.textContent = errMsg;
+  if (body) {
+    const lines = (logs || []).slice(0, 8);
+    body.textContent = lines.length
+      ? lines.join('\n')
+      : '（后端没有留下更多记录）';
+  }
+  fail.hidden = false;
+}
+
+/* --- 30 秒试听 ---
+ * 搜歌结果里的公开预览（无需 cookies）。全局只开一个 Audio，
+ * 点谁停谁：再点正在放的那首 = 停止，点别的 = 切过去。
+ * 换搜索词 / 翻页 / 关搜索视图时也要停 —— 「试听」只在当前页面上有意义。 */
+
+let amPreviewAudio = null;
+
+function amStopPreview() {
+  if (amPreviewAudio) {
+    amPreviewAudio.pause();
+    amPreviewAudio = null;
+  }
+  if (AM.playing >= 0) {
+    AM.playing = -1;
+    amRenderAll();
+  }
+}
+
+function amTogglePreview(index) {
+  const it = AM.results[index];
+  if (!it || !it.preview) return;
+  if (AM.playing === index) {
+    amStopPreview();
+    return;
+  }
+  amStopPreview();
+  amPreviewAudio = new Audio(it.preview);
+  amPreviewAudio.play().catch(() => {
+    // 播不出来（断网 / 格式问题）就不惊动界面，只把状态复位
+    amPreviewAudio = null;
+    AM.playing = -1;
+    amRenderAll();
+  });
+  AM.playing = index;
+  amRenderAll();
 }
 
 /* --- 搜索 --- */
@@ -3391,6 +3501,7 @@ async function amSearch(page = 1) {
 
   AM.busy = true;
   AM.term = term;
+  amStopPreview();   // 新搜索/翻页时停掉试听 —— 结果列表要整块换
   setBtnLoading($('amSearchBtn'), true, '搜索中…');
   amProgressStart(`搜索「${term}」中…`, true);
   amRenderPager();
@@ -3432,7 +3543,12 @@ const AM_POLL_TIMEOUT = 5 * 60 * 1000;
 
 async function amImport(index) {
   const it = AM.results[index];
-  if (!it || AM.importing >= 0) return;
+  if (!it) return;
+  // 已有任务在下载时明确告知，不要点了没反应
+  if (AM.importing >= 0) {
+    toast('已经有歌在下载了，等它完成再试', 'warn');
+    return;
+  }
 
   // 凭证守卫：状态还没加载完时**等一下再判**，不要直接拒绝。
   // 竞态实测：点「搜歌下载」后 amOpenView 里的 amRefreshStatus 是异步的，
@@ -3463,7 +3579,14 @@ async function amImport(index) {
       headers: { 'Content-Type': 'application/json' },
       // 歌名和歌手分开传，后端拼成「歌名-歌手」——
       // 前端拼的话样式一改就要两边一起动。
-      body: JSON.stringify({ url: it.url, song: it.name, artist: it.artist }),
+      // expected_bytes：时长 × AAC-web 均码（32KB/s）估的文件大小，
+      // 后端拿它算下载进度条的百分比；估不准只影响显示快慢。
+      body: JSON.stringify({
+        url: it.url,
+        song: it.name,
+        artist: it.artist,
+        expected_bytes: Math.round((it.duration || 0) * 32 * 1024),
+      }),
     });
     taskId = resp.task_id;
   } catch (err) {
@@ -3480,10 +3603,11 @@ async function amImport(index) {
   const started = Date.now();
   let lastStage = '';
 
-  const finish = (record, errMsg) => {
+  const finish = (record, errMsg, logs) => {
     AM.importing = -1;
     AM.task = null;
     amProgressDone();
+    amProgressFail(errMsg, logs, index);
     amRenderAll();
     if (record) {
       if (addImportedTrack(record)) {
@@ -3492,7 +3616,8 @@ async function amImport(index) {
       }
     } else {
       toast(`下载失败：${errMsg}`, 'error');
-      amRefreshStatus(true);   // 失败多半是凭证问题，复核一次
+      // 失败多半是凭证问题：复核一次状态，把结论写进失败条提醒用户
+      amRefreshStatus(true).then(() => amHintCredential(errMsg));
     }
   };
 
@@ -3504,12 +3629,12 @@ async function amImport(index) {
     try {
       snap = await amApi(`/api/apple/import/${taskId}`);
     } catch (err) {
-      finish(null, err.message);
+      finish(null, err.message, []);
       return;
     }
 
     if (Date.now() - started > AM_POLL_TIMEOUT) {
-      finish(null, '下载超时（超过 5 分钟），请检查网络后重试');
+      finish(null, '下载超时（超过 5 分钟），请检查网络后重试', snap.logs);
       return;
     }
 
@@ -3521,8 +3646,10 @@ async function amImport(index) {
       amProgressSet(snap.percent, snap.detail || snap.stage_label);
     }
 
+    // 只更新正在下载那张卡片的按钮数字和进度条，
+    // 不重建整个结果区 —— 整区重建会让封面图片重载，界面持续闪烁
     AM.task = { percent: snap.percent, stage_label: snap.stage_label, detail: snap.detail };
-    amRenderAll();
+    amUpdateImportingCard(snap.percent);
 
     if (snap.status === 'done') {
       // record 全文在主接口的内存表里；这里补一次拉取
@@ -3536,7 +3663,7 @@ async function amImport(index) {
       return;
     }
     if (snap.status === 'error') {
-      finish(null, snap.error || '未知错误');
+      finish(null, snap.error || '未知错误', snap.logs);
       return;
     }
   }
@@ -3608,6 +3735,7 @@ async function amSaveStorefront(value) {
       body: JSON.stringify({ storefront: value }),
     });
     amRenderStatus(data.status);
+    amStopPreview();   // 结果要清空，试听别还挂着
     AM.results = [];
     AM.page = 1;
     AM.hasNext = false;
@@ -3650,11 +3778,30 @@ function amBind() {
     }
   });
 
-  // 结果卡片上的「下载」
+  // 结果卡片上的「下载」和试听
   $('amResults').addEventListener('click', (e) => {
+    const play = e.target.closest('button[data-play]');
+    if (play) {
+      amTogglePreview(Number(play.dataset.play));
+      return;
+    }
     const btn = e.target.closest('button[data-i]');
     if (btn) amImport(Number(btn.dataset.i));
   });
+
+  // 失败条上的「重试」：重新下载刚才失败的那首。
+  // 注意阻止冒泡 —— 按钮嵌在 <summary> 里，不拦的话点它会同时展开/收起详情
+  const retryBtn = $('svRetryBtn');
+  if (retryBtn) {
+    retryBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      $('svProgressFail').hidden = true;
+      if (amLastFailed >= 0 && AM.results[amLastFailed]) {
+        amImport(amLastFailed);
+      }
+    });
+  }
 
   // 翻页
   const prev = $('amPrevBtn');

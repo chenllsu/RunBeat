@@ -446,8 +446,7 @@ def search(term: str, limit: int = PAGE_SIZE, offset: int = 0) -> dict:
     """按关键词搜歌曲。走公开 catalog 接口，**不需要 cookies 或订阅**。
 
     分页语义：``offset`` 是「跳过前多少条」，前端按 page 换算。
-    另外返回 ``total`` 之类的精确总数 Apple 并不给（只有 next 链接），
-    所以页数用「有没有下一页」推算 —— 见 ``has_next``。
+    ``has_next`` 直接看响应里的 ``next`` 链接（Apple 真实给出）。
     """
     keyword = (term or "").strip()
     if not keyword:
@@ -463,21 +462,23 @@ def search(term: str, limit: int = PAGE_SIZE, offset: int = 0) -> dict:
 
     async def _run() -> dict:
         api = await _api_for_search()
-        raw = await api.get_search_results(
+        return await api.get_search_results(
             keyword, types="songs", limit=limit, offset=offset
         )
-        return raw
 
     try:
-        raw = _run_coro(_run())
+        try:
+            raw = _run_coro(_run())
+        except Exception as exc:  # noqa: BLE001
+            if not _looks_like_token_error(exc):
+                raise
+            # token 失效：清缓存重抓一次再试
+            _invalidate_token()
+            raw = _run_coro(_run())
     except Exception as exc:  # noqa: BLE001
         raise AppleMusicError(f"搜索失败：{_humanize(exc)}") from exc
 
-    items = _shape_songs(raw)
-
-    # 满一页就认为还有下一页；最后一页不足 12 条自然是 false。
-    # 不做额外探测请求 —— 多打一次 Apple 换一个「是否还有」不值当。
-    has_next = len(items) >= limit
+    items, has_next = _shape_songs(raw)
 
     page = offset // limit + 1
     return {
@@ -492,24 +493,109 @@ def search(term: str, limit: int = PAGE_SIZE, offset: int = 0) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# token 缓存
+#
+# 每次 AppleMusicApi.create() 都会重新抓 music.apple.com 首页 + index.js
+# 提取 token，实测固定花 ~2.4 秒；真正的搜索只要 ~0.5 秒。token 是长期
+# 有效的 JWT（exp 在 payload 里），缓存它能让翻页从 3 秒降到半秒。
+#
+# 只缓存 token 字符串，不缓存 client 对象：_run_coro 每次调用都可能开新的
+# 事件循环，httpx 连接池绑定在创建它的循环上，跨循环复用 client 会炸；
+# 而带 token 建对象实测只要 0.03 秒，重建无所谓。
+# --------------------------------------------------------------------------
+
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+_token_lock = threading.Lock()
+
+# 拿不到 exp 时的保底有效期（秒）。JWT 本身有效期很长（数月），
+# 12 小时足够保守，过期重新抓一次也就 2 秒。
+_TOKEN_FALLBACK_TTL = 12 * 3600.0
+
+
+def _jwt_exp(token: str) -> float | None:
+    """从 JWT payload 里解出 exp 时间戳；解不出返回 None（不硬失败）。"""
+    import base64
+    import json
+
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)  # 补齐 base64url 填充
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        return float(exp) if exp else None
+    except Exception:  # noqa: BLE001 —— 解析失败就退回固定 TTL
+        return None
+
+
+def _cached_token() -> str:
+    """拿一个有效 token：缓存命中直接用，过期/为空才真去抓。"""
+    with _token_lock:
+        if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
+            return _token_cache["token"]
+
+    async def _fetch() -> str:
+        from gamdl.api import AppleMusicApi
+
+        return await AppleMusicApi.get_token()
+
+    token = _run_coro(_fetch())
+
+    exp = _jwt_exp(token)
+    # 过期前 1 小时就算过期，留出时钟偏差余量
+    expires_at = (exp - 3600.0) if exp else (time.time() + _TOKEN_FALLBACK_TTL)
+
+    with _token_lock:
+        # 双检：可能另一个线程已经抓到更新的
+        if not (_token_cache["token"] and time.time() < _token_cache["expires_at"]):
+            _token_cache["token"] = token
+            _token_cache["expires_at"] = expires_at
+        return _token_cache["token"] or token
+
+
+def _invalidate_token() -> None:
+    with _token_lock:
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = 0.0
+
+
+def _looks_like_token_error(exc: Exception) -> bool:
+    """判断异常是不是 token 失效类 —— 是就清缓存重试一次。"""
+    text = str(exc).lower()
+    return "401" in text or "unauthorized" in text or "token" in text
+
+
 async def _api_for_search():
-    """搜索用的 API 客户端：有 cookies 就带上（能拿到更多本地化结果），没有也能搜。"""
+    """搜索用的 API 客户端：有 cookies 就带上（能拿到更多本地化结果），没有也能搜。
+
+    token 走缓存（见 _cached_token），跳过每次 2.4 秒的抓取。
+    """
     from gamdl.api import AppleMusicApi
+
+    token = _cached_token()
 
     if cookies_ready():
         try:
             return await AppleMusicApi.create_from_netscape_cookies(
-                str(config.COOKIES_FILE), language=language()
+                str(config.COOKIES_FILE), language=language(), token=token
             )
         except Exception:  # noqa: BLE001 —— 凭证有问题不该拖累搜索
             pass
-    return await AppleMusicApi.create(storefront=storefront(), language=language())
+    return await AppleMusicApi.create(
+        storefront=storefront(), language=language(), token=token
+    )
 
 
-def _shape_songs(raw: dict) -> list[dict]:
-    """把 Apple 的原始结构压成前端好用的扁平行。"""
+def _shape_songs(raw: dict) -> tuple[list[dict], bool]:
+    """把 Apple 的原始结构压成前端好用的扁平行。
+
+    返回 ``(条目列表, 是否还有下一页)``：下一页判断直接看响应里的
+    ``next`` 链接（Apple 真实给出），不再用「满一页就猜有」估算 ——
+    恰好 12 条结果时会多出一个空页。
+    """
     items: list[dict] = []
-    data = (((raw or {}).get("results") or {}).get("songs") or {}).get("data") or []
+    songs = ((raw or {}).get("results") or {}).get("songs") or {}
+    data = songs.get("data") or []
     for song in data:
         attrs = song.get("attributes") or {}
         artwork = attrs.get("artwork") or {}
@@ -518,6 +604,9 @@ def _shape_songs(raw: dict) -> list[dict]:
         if art_url:
             art_url = art_url.replace("{w}x{h}", "200x200")
         duration_ms = attrs.get("durationInMillis") or 0
+        # 30 秒公开预览（无需 cookies），前端试听按钮用
+        previews = attrs.get("previews") or []
+        preview_url = (previews[0].get("url") or "") if previews else ""
         items.append(
             {
                 "id": song.get("id"),
@@ -528,12 +617,13 @@ def _shape_songs(raw: dict) -> list[dict]:
                 "url": attrs.get("url") or "",
                 "duration": round(duration_ms / 1000.0, 1) if duration_ms else 0.0,
                 "artwork": art_url,
+                "preview": preview_url,
                 "has_lyrics": bool(attrs.get("hasLyrics")),
                 "release_date": attrs.get("releaseDate") or "",
                 "isrc": attrs.get("isrc") or "",
             }
         )
-    return items
+    return items, bool(songs.get("next"))
 
 
 # --------------------------------------------------------------------------
@@ -546,8 +636,8 @@ def download_song(
     output_dir: Path | None = None,
     progress=None,
     log=None,
-) -> Path:
-    """下载一首歌的完整音源，返回下载到的本地文件路径。
+) -> tuple[Path, Path]:
+    """下载一首歌的完整音源，返回 ``(音频文件路径, 本次工作目录)``。
 
     每次都用一个**独占子目录**当 output_path：
 
@@ -555,6 +645,10 @@ def download_song(
       文件名由 Apple 的标题决定，调用方事先猜不到；
     * 独占目录让「本次下到了哪个文件」变成一次目录扫描，
       不需要前后 diff，也不会和别的任务串味。
+
+    工作目录随文件一起返回：amdl 的目录模板经过它的清洗函数后可能再派生
+    子目录（历史上 ``"."`` 被清洗成 ``"_"``），**不要**靠 ``file.parent``
+    往上猜根目录 —— 让调用方把 work 显式传给 :func:`adopt` 做清理。
 
     ``progress`` 收到 ``(completed, total)``，``log`` 收到日志行。
     """
@@ -573,7 +667,7 @@ def download_song(
         _download_lock.release()
 
 
-def _download_locked(url: str, output_dir: Path | None, progress, log) -> Path:
+def _download_locked(url: str, output_dir: Path | None, progress, log) -> tuple[Path, Path]:
     from amdl.core_downloader import download_urls
     from amdl.enums import CoverFormat, SongCodec
 
@@ -606,6 +700,9 @@ def _download_locked(url: str, output_dir: Path | None, progress, log) -> Path:
         save_playlist=False,
         no_synced_lyrics=True,
         overwrite=True,
+        # 元数据语言跟「音源设置」走（下载接口支持这个参数，之前漏传，
+        # 曲名/艺人恒为 en-US，界面显示和搜索结果对不上）
+        language=language(),
         ffmpeg_path=_ffmpeg_path(),
         log_callback=_log,
         log_level="INFO",
@@ -647,7 +744,7 @@ def _download_locked(url: str, output_dir: Path | None, progress, log) -> Path:
         )
 
     _log(f"下载完成：{found.name}（{size / 1024 / 1024:.1f} MB）")
-    return found
+    return found, work
 
 
 def _pick_audio_file(folder: Path) -> Path | None:
@@ -676,7 +773,7 @@ def _pick_audio_file(folder: Path) -> Path | None:
     return None
 
 
-def adopt(downloaded: Path, shown_name: str | None = None) -> Path:
+def adopt(downloaded: Path, shown_name: str | None = None, work_dir: Path | None = None) -> Path:
     """把下载产物搬进 ``UPLOAD_DIR``，返回新的本地路径。
 
     搬离 ``imports/`` 的原因：``imports/`` 是暂存区，会被清理逻辑当垃圾删；
@@ -684,6 +781,12 @@ def adopt(downloaded: Path, shown_name: str | None = None) -> Path:
 
     ``shown_name`` 是给界面看的名字（``歌名-歌手``），会写进登记表。
     物理文件名仍用随机 id，避免同名/非法字符问题。
+
+    ``work_dir`` 是 :func:`download_song` 返回的本次工作目录，搬完就整个删掉。
+    必须由调用方显式传入：amdl 的目录模板经过它的清洗函数后可能再派生子目录
+    （历史上 ``"."`` 被清洗成 ``"_"``），靠 ``downloaded.parent`` 往上猜会停在
+    子目录上，``dl_`` 前缀判断不中，残留目录就永远清不掉 —— ``imports/`` 下
+    实测堆过 24 个这样的孤儿。
     """
     src = Path(downloaded)
     suffix = src.suffix.lower()
@@ -695,8 +798,14 @@ def adopt(downloaded: Path, shown_name: str | None = None) -> Path:
     try:
         shutil.move(str(src), str(dest))
     except OSError as exc:
+        # 移动失败时**不能**删工作目录 —— 音频文件还在里面，
+        # 删了用户就得整首重下；留着手动排查或重试。
         raise AppleMusicError(f"保存文件失败：{exc}") from exc
-    finally:
+
+    if work_dir is not None:
+        _cleanup_dir(work_dir)
+    elif src.parent.name.startswith("dl_"):
+        # 兼容旧调用：拿不到显式 work 目录时才按父目录猜
         _cleanup_dir(src.parent)
 
     return dest
@@ -733,19 +842,46 @@ def _cleanup_dir(folder: Path) -> None:
         pass
 
 
+def cleanup_imports_stale(max_age_sec: float = 0.0) -> int:
+    """清扫 ``imports/`` 里的孤儿工作目录，返回删掉的个数。
+
+    正常路径下 :func:`adopt` 会删掉本次的 ``dl_*`` 目录；但下载中途断电、
+    进程被杀、或历史版本留下的目录没人管。这里按目录名前缀 ``dl_`` 识别、
+    按目录 mtime 判断是否超龄（``max_age_sec`` 默认 0 = 全部清扫），
+    由 :func:`app.store.purge_expired` 周期性调用兜底。
+    """
+    removed = 0
+    try:
+        candidates = [p for p in config.IMPORT_DIR.iterdir() if p.is_dir()]
+    except OSError:
+        return 0
+    deadline = time.time() - max_age_sec
+    for folder in candidates:
+        if not folder.name.startswith("dl_"):
+            continue
+        try:
+            if folder.stat().st_mtime > deadline:
+                continue
+            shutil.rmtree(folder, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 # --------------------------------------------------------------------------
 # 小工具
 # --------------------------------------------------------------------------
 
 
 def _build_api():
-    """同步构造一个带 cookies 的 API 客户端（供状态检查用）。"""
+    """同步构造一个带 cookies 的 API 客户端（供状态检查用）。token 走缓存。"""
 
     async def _run():
         from gamdl.api import AppleMusicApi
 
         return await AppleMusicApi.create_from_netscape_cookies(
-            str(config.COOKIES_FILE), language=language()
+            str(config.COOKIES_FILE), language=language(), token=_cached_token()
         )
 
     return _run_coro(_run())
@@ -818,16 +954,88 @@ def _humanize(exc: Exception) -> str:
 # 后台下载任务：下载 + 入库一条龙，全程可轮询进度
 # --------------------------------------------------------------------------
 
+# 进度看护线程的巡检间隔与启动等待（秒）。启动后等 3 秒还没看到
+# 临时文件增长就放弃（多半是还没走到传输那一步），退回日志节点跳变。
+_WATCH_INTERVAL = 0.5
+_WATCH_GRACE = 3.0
+
+# 下载段进度条的起止（与 run_import_task 的 stage_base 对齐）
+_WATCH_BASE = 45
+_WATCH_SPAN = 23   # 45 → 68
+
+
+class _ProgressWatcher:
+    """盯 TMP_DIR 里正在增长的临时文件，把字节量折算成下载段进度。
+
+    amdl 下载时把加密分片写到 ``temp_path``（即 config.TMP_DIR），
+    文件单调变大直到完成。下载锁保证同一时刻只有一个任务，所以
+    「最新的那个在长的文件」就是本次的 —— 不需要身份标记。
+    """
+
+    def __init__(self, tid: str, expected_bytes: int) -> None:
+        self.tid = tid
+        self.expected = max(1, int(expected_bytes or 0))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_seen = 0.0   # 最近一次看到文件在长的时间
+
+    def start(self) -> "_ProgressWatcher":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _scan_tmp(self) -> int:
+        """TMP_DIR 里最大文件的字节数；空目录/读不了就是 0。"""
+        try:
+            return max(
+                (p.stat().st_size for p in config.TMP_DIR.iterdir() if p.is_file()),
+                default=0,
+            )
+        except OSError:
+            return 0
+
+    def _run(self) -> None:
+        # 宽限期内没等到文件增长就退出，别为一个空目录空转整个下载期
+        deadline = _now() + _WATCH_GRACE
+        while not self._stop.is_set():
+            size = self._scan_tmp()
+            now = _now()
+            if size > 0:
+                self._last_seen = now
+            elif self._last_seen == 0.0 and now > deadline:
+                return
+
+            frac = min(1.0, size / self.expected)
+            mb = size / 1024 / 1024
+            task_update(
+                self.tid,
+                percent=int(_WATCH_BASE + _WATCH_SPAN * frac),
+                detail=f"下载音源… 已下载 {mb:.1f} MB",
+            )
+            self._stop.wait(_WATCH_INTERVAL)
+
+
+def _start_progress_watcher(tid: str, expected_bytes: int) -> _ProgressWatcher:
+    return _ProgressWatcher(tid, expected_bytes).start()
+
 def run_import_task(
     tid: str,
     url: str,
     song_name: str,
     artist: str,
     ingest_fn,
+    expected_bytes: int = 0,
 ) -> None:
     """后台线程入口：完整跑一遍「下载 → 保存 → 入库」，实时更新任务状态。
 
     ``ingest_fn`` 是 main._ingest_one（避免循环 import，由调用方注入）。
+    ``expected_bytes`` 是搜索结果估的文件大小（时长 × 码率），给进度看护
+    线程当分母；估不准只影响进度条快慢，不影响下载本身。
 
     五个阶段与百分比（STAGE_WEIGHTS 的累加）：
         init 0-5 → parse 5-15 → download 15-70 → save 70-80 → analyze 80-100
@@ -854,9 +1062,12 @@ def run_import_task(
         #
         # amdl 的 progress_callback 只在**每首**歌完成后回调一次 (n, total)，
         # 单曲场景拿不到字节级进度 —— 这是 amdl 的设计，不是能改的。
-        # 所以下载段的进度用「日志关键字节点」推进：amdl 的日志顺序稳定
-        # （创建接口 → 接口就绪 → 下载中 → 完成），按节点跳 15→22→30→45，
-        # 节点之间不再编造数字 —— 配合前端显示的已用时，比假百分比诚实。
+        # 进度这样给：
+        #   1) 日志关键字先跳几个节点（15→22→30→45），让界面有反应；
+        #   2) 起一个看护线程盯 TMP_DIR 里正在增长的临时文件，
+        #      按文件大小折算 45→68 的真实进度并显示已下载 MB ——
+        #      下载锁保证同时只有一个任务，临时文件归属不会错；
+        #   3) 找不到临时文件时看护线程自动退出，退回节点跳变。
         milestones = {
             "creating applemusicbaseinterface": 22,
             "applemusicinterface ready": 30,
@@ -877,12 +1088,16 @@ def run_import_task(
             task_update(tid, percent=68, detail="音源已取得，正在保存")
 
         go_stage("download", "下载音源…")
-        downloaded = download_song(url, progress=on_progress, log=on_log)
+        watcher = _start_progress_watcher(tid, expected_bytes)
+        try:
+            downloaded, work = download_song(url, progress=on_progress, log=on_log)
+        finally:
+            watcher.stop()
 
         # ---- 保存 ----
         go_stage("save", "保存文件…")
         shown = display_name(song_name, artist)
-        local_path = adopt(downloaded, shown)
+        local_path = adopt(downloaded, shown, work_dir=work)
 
         # ---- BPM 分析入库 ----
         go_stage("analyze", "分析节拍中…")
@@ -906,7 +1121,13 @@ def run_import_task(
         say(f"完成：{shown}（{record.get('detected_bpm', '?')} BPM）")
 
     except BaseException as exc:  # noqa: BLE001 —— 后台线程必须自己兜住一切
-        msg = _humanize(exc) if isinstance(exc, AppleMusicError) else f"{exc}"
+        # 分支不能写反：AppleMusicError 已经是人话（_humanize 或手写的提示），
+        # 原样展示；其它异常（httpx 超时、OSError 等）是英文技术串，
+        # 才需要翻译。写反了用户看到的是 "Server disconnected" 这种原文。
+        if isinstance(exc, AppleMusicError):
+            msg = str(exc)
+        else:
+            msg = _humanize(exc)
         task_update(
             tid,
             status="error",

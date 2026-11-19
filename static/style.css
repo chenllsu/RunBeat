@@ -1550,6 +1550,17 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 
 .pb-play:hover { filter: brightness(1.07); }
 
+/* 正在播放：外圈脉冲扩散（与搜索页试听按钮同款，搜索页用的类名是 sv-play.on） */
+@keyframes pbPlayPulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent), 0 2px 10px rgba(var(--accent-rgb), .22); }
+  70%  { box-shadow: 0 0 0 8px transparent, 0 2px 10px rgba(var(--accent-rgb), .22); }
+  100% { box-shadow: 0 0 0 0 transparent, 0 2px 10px rgba(var(--accent-rgb), .22); }
+}
+.pb-play.is-playing { animation: pbPlayPulse 1.6s ease-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .pb-play.is-playing { animation: none; }
+}
+
 .pb-stop {
   width: 36px;
   height: 36px;
@@ -2372,6 +2383,45 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   font-variant-numeric: tabular-nums;
 }
 
+/* 30 秒试听按钮：小的圆形播放键，正在放时变高亮 */
+.sv-play {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--dur-1) var(--ease);
+}
+.sv-play:hover { border-color: var(--accent); color: var(--accent); }
+.sv-play.on {
+  background: var(--grad);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+
+/* 正在播的试听按钮：外圈脉冲扩散，一眼看出哪首在响 */
+@keyframes svPlayPulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70%  { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.sv-play.on {
+  animation: svPlayPulse 1.6s ease-out infinite;
+}
+/* 系统说不要动效就一点也别动（与全站约定一致） */
+@media (prefers-reduced-motion: reduce) {
+  .sv-play.on { animation: none; }
+}
+
 .sv-card .btn {
   flex: 0 0 auto;
   padding: 5px 11px;
@@ -2450,10 +2500,11 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
   transition: width var(--dur-2) var(--ease);
 }
 
-/* indeterminate 态：一段 30% 宽的亮条来回跑 */
+/* indeterminate 态：一段 30% 宽的亮条缓慢来回 —— 速度放慢到 2.4s，
+ * 之前 1.1s 闪得太快晃眼睛 */
 .sv-progress.indet .sv-progress-bar {
   width: 30% !important;
-  animation: svSlide 1.1s var(--ease) infinite;
+  animation: svSlide 2.4s ease-in-out infinite;
 }
 
 @keyframes svSlide {
@@ -2472,6 +2523,49 @@ button.btn.danger:hover:not(:disabled) { background: #ff6b70; border-color: #ff6
 .sv-progress-text .spinner { width: 11px; height: 11px; border-width: 2px; }
 .sv-progress-text b { color: var(--text); font-weight: 600; }
 .sv-progress-text .sv-pct { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+/* 下载失败条：摘要 + 可展开的日志 */
+.sv-fail {
+  flex: 0 0 auto;
+  border: 1px solid rgba(229, 83, 75, .45);
+  border-radius: 8px;
+  background: rgba(229, 83, 75, .08);
+  overflow: hidden;
+}
+.sv-fail-summary {
+  padding: 7px 12px;
+  font-size: 11.5px;
+  color: #e5534b;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.sv-fail-summary .sv-fail-text { flex: 1 1 auto; min-width: 0; }
+.sv-fail-summary .am-mini {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.sv-fail-summary .am-mini:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.sv-fail-summary::-webkit-details-marker { display: none; }
+.sv-fail-summary::before { content: '▸ '; }
+.sv-fail[open] .sv-fail-summary::before { content: '▾ '; }
+.sv-fail-logs {
+  margin: 0;
+  padding: 4px 12px 10px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 180px;
+  overflow-y: auto;
+}
 
 /* 下载中的卡片：进度条嵌在卡片底部 */
 .sv-card .sv-card-progress {

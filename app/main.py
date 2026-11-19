@@ -772,6 +772,9 @@ class AppleImportRequest(BaseModel):
     song: str | None = Field(None, max_length=200, description="歌名")
     artist: str | None = Field(None, max_length=200, description="歌手")
     name: str | None = Field(None, max_length=300, description="兼容旧调用：直接给完整显示名")
+    # 搜索结果估的文件大小（时长 × 码率），给下载进度条当分母；
+    # 估不准只影响进度显示快慢，不影响下载。0 = 没估，进度退回节点跳变。
+    expected_bytes: int = Field(0, ge=0, le=200_000_000)
 
 
 class AppleCookiesRequest(BaseModel):
@@ -848,7 +851,10 @@ async def apple_import(req: AppleImportRequest) -> dict:
     # daemon=True：服务关闭时不被它拖住 —— 本机任务丢了重下就是。
     worker = threading.Thread(
         target=apple_music.run_import_task,
-        args=(tid, req.url, req.song or "", req.artist or "", _ingest_one),
+        args=(
+            tid, req.url, req.song or "", req.artist or "", _ingest_one,
+            req.expected_bytes,
+        ),
         daemon=True,
     )
     worker.start()

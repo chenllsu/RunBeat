@@ -138,6 +138,18 @@ def purge_expired() -> int:
                 if path:
                     removed += int(safe_unlink(Path(path)))
 
+    # imports/ 的孤儿下载目录也要兜底：正常路径 adopt() 会删，但进程被杀、
+    # 断电或历史版本残留的没人管（实测堆过 24 个 dl_* 空目录）。
+    # 下载进行中（目录 mtime 还新）的不碰，超龄的整目录删。
+    try:
+        from . import apple_music
+
+        removed += apple_music.cleanup_imports_stale(
+            max_age_sec=config.RETENTION_HOURS * 3600
+        )
+    except Exception:  # noqa: BLE001 —— 打扫动作绝不影响主流程
+        pass
+
     return removed
 
 

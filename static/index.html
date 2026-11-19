@@ -121,6 +121,15 @@
         </div>
         <div class="sv-progress-text" id="svProgressText" hidden></div>
 
+        <!-- 下载失败时出现：一句话摘要 + 重试按钮 + 可展开的后端日志 -->
+        <details class="sv-fail" id="svProgressFail" hidden>
+          <summary class="sv-fail-summary">
+            <span class="sv-fail-text">下载失败</span>
+            <button class="btn ghost am-mini" id="svRetryBtn" type="button">重试</button>
+          </summary>
+          <pre class="sv-fail-logs"></pre>
+        </details>
+
         <div class="sv-head">
           <h2>搜歌下载</h2>
           <span class="sv-count" id="svCount"></span>
