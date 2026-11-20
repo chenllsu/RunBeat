@@ -46,8 +46,9 @@ A few things worth knowing up front, to save you some "I thought it was broken" 
 
 **Online music source**
 
-Click "⌕ Search & Download" in the top bar to search the Apple Music catalog by title / artist; a three-column grid shows 12 results per page with plain pagination.
-Clicking "Download" runs download → BPM detection → library import automatically, with stage-by-stage progress. Downloaded songs are **fully equivalent** to manually uploaded ones — the whole stretch/export pipeline works the same.
+Click "⌕ Search & Download" in the top bar (or the hero button on the empty state) to search the Apple Music catalog by title / artist; a three-column grid shows 12 results per page with plain pagination, and every result can be **auditioned for 30 seconds** before downloading.
+Clicking "Download" runs download → BPM detection → library import automatically, with stage-by-stage progress (the progress bar reflects actual downloaded bytes).
+Downloaded songs are **fully equivalent** to manually uploaded ones — the whole stretch/export pipeline works the same.
 
 - Requires an active **Apple Music subscription**: paste browser-exported cookies in "Source settings" on first use (three-step guide)
 - Names are normalized to `Title-Artist`; credentials stay on this machine only (`data/cookies.txt`), never uploaded
@@ -95,8 +96,6 @@ putting the online-search path right in front of new users. Once you have any so
 
 The editor is a **two-column layout**: the left column manages files and tools, the right column walks through the workflow.
 
-![RunBeat main UI: left column has upload, library and cache management; right column has five workflow cards; a floating play bar sits at the bottom](docs/ui-preview-normal.png)
-
 | Area | What it does |
 |---|---|
 | Empty-state hero (no songs yet) | Big title + "⌕ Search & Download" primary button + "＋ Add local songs" secondary button; you can also drag files anywhere on the page to upload |
@@ -116,9 +115,7 @@ The editor is a **two-column layout**: the left column manages files and tools, 
 | 4 | Export | Render the full result and download, optional metronome click (affects the file only, not audition) |
 | — | Batch export | Render every checked song in the library, bundled into one zip |
 
-When the target cadence falls outside your stretch range, card 3 doesn't silently hand you a different result — it says exactly where it was clamped and what cadence you'll actually get:
-
-![Stretch range clamped: target 175 spm needs ×1.367, above the ×1.150 limit, actual output 147 spm](docs/ui-preview-clamped.png)
+When the target cadence falls outside your stretch range, card 3 doesn't silently hand you a different result — it says exactly where it was clamped and what cadence you'll actually get.
 
 ### The auditions, and how they differ
 
@@ -202,7 +199,7 @@ runbeats/
 │   └── e2e_test.py        End-to-end HTTP tests
 ├── .github/workflows/
 │   └── release.yml   Tag → auto-package → attach zip to Release
-├── docs/             UI screenshots + [implementation notes](docs/ARCHITECTURE.md)
+├── docs/             [implementation notes](docs/ARCHITECTURE.md)
 ├── data/             Generated at runtime, see next section
 ├── runbeat_desktop.py  Desktop launcher (also the PyInstaller entry)
 ├── RunBeat.spec        PyInstaller packaging config
@@ -216,7 +213,8 @@ runbeats/
 ## What the data directory is for
 
 **Everything under `data/` is runtime-generated; deleting it does not affect the program** — the service rebuilds what it needs,
-only uploaded files and generated results are lost. Cleanup is handled by `store.purge_expired()`, every 30 minutes, 6-hour retention.
+only uploaded files and generated results are lost. Cleanup is handled by `store.purge_expired()`, every 30 minutes, 6-hour retention
+(it also sweeps orphaned download directories left in `imports/` by interrupted runs).
 
 | Subdirectory | Contents | When created | Auto-cleaned? |
 |---|---|---|---|
@@ -254,7 +252,7 @@ Implementation details of the cleanup mechanism and one fixed historical pitfall
 | POST | `/api/package` | Bundle several rendered results into one zip (batch export) |
 | GET | `/api/download/{name}` | Download a result (audio or zip) |
 | POST | `/api/apple/search` | Apple Music search (public catalog, no cookies needed; `offset` pagination) |
-| POST | `/api/apple/import` | Submit a download task, returns `task_id` immediately (background thread runs it) |
+| POST | `/api/apple/import` | Submit a download task, returns `task_id` immediately (background thread runs it; optional `expected_bytes` for progress estimation) |
 | GET | `/api/apple/import/{task_id}` | Poll download progress: stage, percent, logs |
 | GET | `/api/apple/record/{task_id}` | Full import record after success |
 | GET/POST/DELETE | `/api/apple/cookies` | Credential management (paste text or local file, stored locally only) |
