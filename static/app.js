@@ -1279,6 +1279,7 @@ function initUI() {
   // 搜索视图在前台时不要抢回来：用户正在挑歌，突然被切走会很突兀。
   $('panel').hidden = !!AM.open;
   $('playerBar').hidden = false;   // 底部常驻播放条跟着编辑器一起出现
+  updateEmptyHero();
 
   const okList = state.files.filter((f) => f.status === 'ok');
   const nth = okList.indexOf(t) + 1;
@@ -1353,6 +1354,7 @@ function renderFileList() {
 
   // 首次引导只在还没歌的时候显示
   $('firstHint').hidden = state.files.length > 0;
+  updateEmptyHero();   // 空状态大引导块跟着「有没有歌」一起切换
 
   card.hidden = state.files.length === 0;
   if (card.hidden) {
@@ -2452,8 +2454,13 @@ $('dropzone').addEventListener('drop', (e) => {
   if (dropped && dropped.length) handleFiles(dropped);
 });
 
+// 空状态引导页左栏收起了，拖拽上传靠整窗兜底：拖到页面任何位置都能收
 window.addEventListener('dragover', (e) => e.preventDefault());
-window.addEventListener('drop', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const dropped = e.dataTransfer && e.dataTransfer.files;
+  if (dropped && dropped.length && !AM.open) handleFiles(dropped);
+});
 
 $('bpmInput').addEventListener('input', () => {
   const value = parseFloat($('bpmInput').value);
@@ -3087,6 +3094,9 @@ pollStartup();
 // 顺带把 data/ 的占用拉回来，「缓存与数据」的标题栏一进页面就有数字
 loadStorage();
 
+// 空状态引导块：页面刚打开就要决定显不显示（没歌时占据主区域引导新用户）
+updateEmptyHero();
+
 // 没勾「渐进切入」时，时长框一开始就该是灰的
 syncFadeUI();
 
@@ -3142,10 +3152,29 @@ async function amApi(path, options = {}) {
   return data;
 }
 
+/* 空状态引导块：只在「没有任何歌、且不在搜索视图」时占据主区域。
+ * 它是「搜歌下载」在首屏的第二入口 —— 光靠顶栏小按钮，新用户很难发现能搜歌。
+ * 空状态下左栏的上传/提示/缓存卡也一起收掉：整个页面只剩引导，
+ * 不会出现「左边一摞卡片 + 右边一块居中内容」的歪斜构图。 */
+function updateEmptyHero() {
+  const hero = $('emptyHero');
+  if (!hero) return;
+  const empty = state.files.length === 0 && !AM.open;
+  hero.hidden = !empty;
+  // 空状态整页只剩引导：左栏整列收掉（否则空列占位，引导整体偏右）。
+  // 拖拽上传有整窗监听兜底，顶栏「添加歌曲」也能选文件，入口不丢。
+  document.body.classList.toggle('empty-state', empty);
+  $('dropzone').hidden = empty;
+  $('firstHint').hidden = empty || state.files.length > 0;
+  $('cacheCard').hidden = empty;
+}
+
 /* --- 视图切换 --- */
 
 function amOpenView() {
   AM.open = true;
+  amStopPreview();   // 离开主区前把试听停掉（如果开着）
+  updateEmptyHero(); // 搜索视图接管主区，引导块让位
   $('searchView').hidden = false;
   $('panel').hidden = true;
   document.body.classList.add('search-open');
@@ -3166,6 +3195,7 @@ function amOpenView() {
 function amCloseView() {
   AM.open = false;
   amStopPreview();   // 离开搜索页，试听别还挂着声音
+  updateEmptyHero(); // 回到主区：没歌的话引导块回来
   $('searchView').hidden = true;
   // 有没有歌决定编辑区露不露，沿用既有规则
   $('panel').hidden = !state.track;
@@ -3751,6 +3781,12 @@ function amBind() {
   // 顶栏入口 / 返回
   const openBtn = $('topSearchBtn');
   if (openBtn) openBtn.addEventListener('click', amOpenView);
+
+  // 空状态引导块上的两个按钮：搜歌 / 添加本地歌曲
+  const heroSearch = $('heroSearchBtn');
+  if (heroSearch) heroSearch.addEventListener('click', amOpenView);
+  const heroAdd = $('heroAddBtn');
+  if (heroAdd) heroAdd.addEventListener('click', () => $('fileInput').click());
 
   const backBtn = $('svBackBtn');
   if (backBtn) backBtn.addEventListener('click', amCloseView);

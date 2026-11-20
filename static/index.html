@@ -14,7 +14,7 @@
     <h1 class="logo">Run<span>Beat</span></h1>
     <span class="slogan">把任何一首歌改成你的步频</span>
     <span class="tb-spacer"></span>
-    <button class="btn" id="topSearchBtn" type="button">⌕ 搜歌下载</button>
+    <button class="btn accent" id="topSearchBtn" type="button"><span class="ico-search">⌕</span> 搜歌下载</button>
     <button class="btn primary" id="topAddBtn" type="button">＋ 添加歌曲</button>
   </header>
 
@@ -108,6 +108,21 @@
 
     <!-- ============================ 右栏：编辑器 -->
     <main class="main scroll">
+
+      <!-- ====================== 空状态引导
+           还没有任何歌、也不在搜索视图时占据主区域（左栏的上传/提示/缓存卡
+           同步收起，见 updateEmptyHero）：告诉新用户两条路 —— 在线搜歌 /
+           本地文件。有歌后（#panel 出现）它自动让位。 -->
+      <div class="empty-hero" id="emptyHero" hidden>
+        <h2>想跑步听歌？先弄一首进来</h2>
+        <p class="eh-sub">自动测出原曲节奏，按你的步频生成配套音乐</p>
+        <div class="eh-actions">
+          <button class="btn primary" id="heroSearchBtn" type="button"><span class="ico-search">⌕</span> 搜歌下载</button>
+          <span class="eh-or">或者</span>
+          <button class="btn" id="heroAddBtn" type="button">＋ 添加本地歌曲</button>
+        </div>
+        <p class="eh-note">搜歌需要 Apple Music 订阅；本地文件不需要。都只在本机处理。</p>
+      </div>
 
       <!-- ====================== 搜索视图
            点顶栏「搜歌下载」时整块切换到这里。
