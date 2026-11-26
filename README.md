@@ -1,22 +1,11 @@
-<div align="center">
-  <a href="./README_EN.md">English</a> · <a href="./README.md">中文</a>
+<p align="center"><img src="docs/icons/icon-final.png" width="120" alt="RunBeat"></p>
 
-  <img src="docs/icons/icon-final.png" alt="RunBeat" width="130">
+<h1 align="center">RunBeat</h1>
 
-  <h1>RunBeat</h1>
+<p align="center">把任何一首歌，变成你的跑步步频<br>
+每一步踩在鼓点上 · 音高不变 · 变速只在本机进行</p>
 
-  <b>把任何一首歌，变成你的跑步步频</b>
-
-  <p>每一步踩在鼓点上 · 音高不变 · 变速只在本机进行</p>
-
-  <a href="https://github.com/chenllsu/RunBeat/releases/latest"><img src="https://img.shields.io/github/v/release/chenllsu/RunBeat?style=flat-square" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License"></a>
-  <a href="https://github.com/chenllsu/RunBeat"><img src="https://img.shields.io/badge/Windows-10%2B%20x64-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform"></a>
-
-  <p><a href="https://github.com/chenllsu/RunBeat/releases/latest"><b>⬇ 下载 Windows 版（约 130 MB）</b></a></p>
-</div>
-
----
+<p align="center"><a href="./README_EN.md">English</a> · 中文</p>
 
 ## 为什么需要它
 
@@ -39,7 +28,7 @@ RunBeat 检测原曲速度，把整首歌均匀拉长或压短到你的目标步
 
 ## 上手
 
-下载 zip → 解压 → 双击 `RunBeat.exe` → 拖一首歌进去 → 调步频 → 生成下载。
+从 [Releases](https://github.com/chenllsu/RunBeat/releases/latest) 下载 zip → 解压 → 双击 `RunBeat.exe` → 拖一首歌进去 → 调步频 → 生成下载。
 
 开发者从源码运行：
 

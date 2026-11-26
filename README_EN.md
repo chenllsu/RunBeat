@@ -1,22 +1,11 @@
-<div align="center">
-  <a href="./README_EN.md">English</a> · <a href="./README.md">中文</a>
+<p align="center"><img src="docs/icons/icon-final.png" width="120" alt="RunBeat"></p>
 
-  <img src="docs/icons/icon-final.png" alt="RunBeat" width="130">
+<h1 align="center">RunBeat</h1>
 
-  <h1>RunBeat</h1>
+<p align="center">Turn any song into your running cadence<br>
+Every step lands on a beat · Pitch unchanged · All processing stays on your machine</p>
 
-  <b>Turn any song into your running cadence</b>
-
-  <p>Every step lands on a beat · Pitch unchanged · All processing stays on your machine</p>
-
-  <a href="https://github.com/chenllsu/RunBeat/releases/latest"><img src="https://img.shields.io/github/v/release/chenllsu/RunBeat?style=flat-square" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License"></a>
-  <a href="https://github.com/chenllsu/RunBeat"><img src="https://img.shields.io/badge/Windows-10%2B%20x64-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform"></a>
-
-  <p><a href="https://github.com/chenllsu/RunBeat/releases/latest"><b>⬇ Download for Windows (~130 MB)</b></a></p>
-</div>
-
----
+<p align="center">English · <a href="./README.md">中文</a></p>
 
 ## Why
 
@@ -39,7 +28,7 @@ There's also "⌕ Search & download": search Apple Music directly, audition 30 s
 
 ## Get started
 
-Download the zip → extract → run `RunBeat.exe` → drag a song in → set cadence → generate & download.
+Download the zip from [Releases](https://github.com/chenllsu/RunBeat/releases/latest) → extract → run `RunBeat.exe` → drag a song in → set cadence → generate & download.
 
 From source:
 
