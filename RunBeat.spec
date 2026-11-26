@@ -70,6 +70,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # 应用图标（四条声波柱）。ico 由 docs/icons/icon-final.png 转出，
+    # 含 256/128/64/48/32/16 六档尺寸，资源管理器与任务栏各取所需。
+    icon="docs/icons/RunBeat.ico",
 )
 
 coll = COLLECT(

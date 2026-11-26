@@ -257,10 +257,12 @@ def _run_window(url: str) -> bool:
     try:
         # private_mode=False 才会把 localStorage 之类落到磁盘，
         # 否则用户每次打开都是全新会话。
-        webview.start(
-            private_mode=False,
-            storage_path=str((_root or Path(".")) / "webview"),
-        )
+        # icon：窗口/任务栏图标（WinForms 后端读取）；找不到就退回 exe 内嵌图标。
+        icon_path = (_root or Path(".")) / "docs" / "icons" / "RunBeat.ico"
+        start_kwargs = {"private_mode": False, "storage_path": str((_root or Path(".")) / "webview")}
+        if icon_path.is_file():
+            start_kwargs["icon"] = str(icon_path)
+        webview.start(**start_kwargs)
         return True
     except Exception as exc:
         _say(f"窗口启动失败（{exc}），改用浏览器")
